@@ -227,7 +227,13 @@ app.post('/api/auth/login', requireDB, async (req, res) => {
         }
 
         const user = users[0];
-        const isValidPassword = await bcrypt.compare(password, user.password);
+        console.log('Password comparison:', {
+    inputPassword: password,
+    storedHash: user.password,
+    hashLength: user.password.length
+});
+const isValidPassword = await bcrypt.compare(password, user.password);
+console.log('Password valid:', isValidPassword);
 
         if (!isValidPassword) {
             return res.status(401).json({ error: 'Invalid credentials' });
