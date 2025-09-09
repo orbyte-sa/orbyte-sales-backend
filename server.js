@@ -33,7 +33,7 @@ if (!fs.existsSync('uploads')) {
 
 // Database configuration for Render + Hostinger
 const dbConfig = {
-    host: process.env.DB_HOST || 'localhost',
+    host: process.env.DB_HOST || '193.203.168.132',
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
