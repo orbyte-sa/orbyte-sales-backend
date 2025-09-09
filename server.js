@@ -16,8 +16,10 @@ const PORT = process.env.PORT || 10000; // Render uses port 10000
 app.use(cors({
     origin: [
         'http://localhost:3000',
-        'https://yourdomain.com', // Replace with your actual domain
-        'https://your-render-app.onrender.com'
+        'https://team.orbyte360.com',           // Your actual subdomain
+        'https://orbyte360.com',                // Your main domain
+        'https://www.orbyte360.com',            // WWW version
+        'https://orbyte-sales-api.onrender.com' // Backend URL
     ],
     credentials: true
 }));
