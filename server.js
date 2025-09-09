@@ -32,24 +32,76 @@ if (!fs.existsSync('uploads')) {
     fs.mkdirSync('uploads', { recursive: true });
 }
 
-// Database configuration - Using IP address for better connectivity
-const dbConfig = {
+// Database configuration - Using connection pool to fix "closed state" error
+const poolConfig = {
     host: process.env.DB_HOST || '193.203.168.132',
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME,
     port: 3306,
-    connectTimeout: 30000,
-    ssl: false,
-    timezone: '+00:00'
+    waitForConnections: true,
+    connectionLimit: 5,
+    queueLimit: 0,
+    acquireTimeout: 60000,
+    timeout: 60000,
+    reconnect: true,
+    multipleStatements: false,
+    ssl: false
 };
 
-console.log('Database config:', {
-    host: dbConfig.host,
-    user: dbConfig.user,
-    database: dbConfig.database,
-    port: dbConfig.port
+console.log('Database pool config:', {
+    host: poolConfig.host,
+    user: poolConfig.user,
+    database: poolConfig.database,
+    port: poolConfig.port,
+    connectionLimit: poolConfig.connectionLimit
 });
+
+// Create connection pool
+const pool = mysql.createPool(poolConfig);
+
+// Test database connection
+let dbConnectionStatus = 'unknown';
+
+async function testConnection() {
+    try {
+        const connection = await pool.getConnection();
+        await connection.execute('SELECT 1 as test');
+        await connection.execute(`SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = ?`, [poolConfig.database]);
+        connection.release();
+        
+        dbConnectionStatus = 'connected';
+        console.log('✅ Database connection pool established successfully');
+        
+        // Test if required tables exist
+        const [tables] = await pool.execute(`
+            SELECT table_name FROM information_schema.tables 
+            WHERE table_schema = ? AND table_name IN ('users', 'cold_calling_reports', 'telemarketing_reports')
+        `, [poolConfig.database]);
+        
+        console.log('Available tables:', tables.map(t => t.table_name));
+        
+        if (tables.length === 3) {
+            console.log('✅ All required tables found');
+        } else {
+            console.log('⚠️ Some tables may be missing:', {
+                found: tables.length,
+                expected: 3,
+                tables: tables.map(t => t.table_name)
+            });
+        }
+        
+    } catch (error) {
+        dbConnectionStatus = 'error: ' + error.message;
+        console.error('❌ Database connection failed:', error.message);
+        
+        // Retry connection after delay
+        setTimeout(testConnection, 10000);
+    }
+}
+
+// Initialize database connection
+testConnection();
 
 // File upload configuration
 const storage = multer.diskStorage({
@@ -79,48 +131,6 @@ const upload = multer({
 // JWT Secret
 const JWT_SECRET = process.env.JWT_SECRET || 'orbyte_sales_secret_key_2025';
 
-// Database connection
-let db;
-let connectionAttempts = 0;
-const maxRetries = 5;
-
-async function initDB() {
-    try {
-        connectionAttempts++;
-        console.log(`Database connection attempt ${connectionAttempts}/${maxRetries}`);
-        
-        db = await mysql.createConnection(dbConfig);
-        
-        // Test connection
-        await db.execute('SELECT 1 as test');
-        console.log('✅ Connected to MySQL database successfully');
-        
-        // Test if tables exist
-        const [tables] = await db.execute(`
-            SELECT table_name FROM information_schema.tables 
-            WHERE table_schema = ? AND table_name IN ('users', 'cold_calling_reports', 'telemarketing_reports')
-        `, [dbConfig.database]);
-        
-        console.log('Available tables:', tables.map(t => t.table_name));
-        
-        if (tables.length === 3) {
-            console.log('✅ All required tables found');
-        } else {
-            console.log('⚠️ Some tables may be missing');
-        }
-        
-    } catch (error) {
-        console.error(`❌ Database connection failed (attempt ${connectionAttempts}):`, error.message);
-        
-        if (connectionAttempts < maxRetries) {
-            console.log(`Retrying in 5 seconds...`);
-            setTimeout(initDB, 5000);
-        } else {
-            console.error('❌ Max database connection attempts reached');
-        }
-    }
-}
-
 // Health check endpoint
 app.get('/api/health', async (req, res) => {
     const health = {
@@ -128,17 +138,17 @@ app.get('/api/health', async (req, res) => {
         message: 'Orbyte Sales API is running',
         timestamp: new Date().toISOString(),
         environment: process.env.NODE_ENV || 'development',
-        database: 'disconnected'
+        database: dbConnectionStatus
     };
     
-    // Check database connection
-    if (db) {
-        try {
-            await db.execute('SELECT 1 as test');
-            health.database = 'connected';
-        } catch (error) {
-            health.database = 'error: ' + error.message;
-        }
+    // Test current database connection
+    try {
+        const connection = await pool.getConnection();
+        await connection.execute('SELECT 1 as test');
+        connection.release();
+        health.database = 'connected';
+    } catch (error) {
+        health.database = 'error: ' + error.message;
     }
     
     res.json(health);
@@ -150,6 +160,7 @@ app.get('/', (req, res) => {
         message: 'Orbyte Sales API Server',
         status: 'Running',
         version: '1.0.0',
+        database: dbConnectionStatus,
         endpoints: {
             health: '/api/health',
             login: '/api/auth/login',
@@ -187,7 +198,7 @@ const requireAdmin = (req, res, next) => {
 
 // Database check middleware
 const requireDB = (req, res, next) => {
-    if (!db) {
+    if (dbConnectionStatus.startsWith('error:') || dbConnectionStatus === 'unknown') {
         return res.status(503).json({ error: 'Database connection not available' });
     }
     next();
@@ -195,6 +206,7 @@ const requireDB = (req, res, next) => {
 
 // Auth Routes
 app.post('/api/auth/login', requireDB, async (req, res) => {
+    let connection;
     try {
         const { email, password } = req.body;
 
@@ -204,7 +216,8 @@ app.post('/api/auth/login', requireDB, async (req, res) => {
 
         console.log('Login attempt for:', email);
 
-        const [users] = await db.execute(
+        connection = await pool.getConnection();
+        const [users] = await connection.execute(
             'SELECT * FROM users WHERE email = ? AND status = "active"',
             [email]
         );
@@ -248,23 +261,30 @@ app.post('/api/auth/login', requireDB, async (req, res) => {
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({ error: 'Login failed: ' + error.message });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
 // User Management Routes (Admin only)
 app.get('/api/users', authenticateToken, requireAdmin, requireDB, async (req, res) => {
+    let connection;
     try {
-        const [users] = await db.execute(
+        connection = await pool.getConnection();
+        const [users] = await connection.execute(
             'SELECT id, name, email, role, executive_type, status, created_at FROM users ORDER BY created_at DESC'
         );
         res.json(users);
     } catch (error) {
         console.error('Get users error:', error);
         res.status(500).json({ error: 'Failed to fetch users' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
 app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, res) => {
+    let connection;
     try {
         const { name, email, password, role, executive_type } = req.body;
 
@@ -272,8 +292,10 @@ app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, r
             return res.status(400).json({ error: 'All fields are required' });
         }
 
+        connection = await pool.getConnection();
+
         // Check if user already exists
-        const [existingUsers] = await db.execute(
+        const [existingUsers] = await connection.execute(
             'SELECT id FROM users WHERE email = ?',
             [email]
         );
@@ -284,7 +306,7 @@ app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, r
 
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        const [result] = await db.execute(
+        const [result] = await connection.execute(
             'INSERT INTO users (name, email, password, role, executive_type, status) VALUES (?, ?, ?, ?, ?, "active")',
             [name, email, hashedPassword, role, executive_type]
         );
@@ -297,13 +319,18 @@ app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, r
     } catch (error) {
         console.error('Create user error:', error);
         res.status(500).json({ error: 'Failed to create user' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
 app.put('/api/users/:id', authenticateToken, requireAdmin, requireDB, async (req, res) => {
+    let connection;
     try {
         const { id } = req.params;
         const { name, email, role, executive_type, status, password } = req.body;
+
+        connection = await pool.getConnection();
 
         let updateQuery = 'UPDATE users SET name = ?, email = ?, role = ?, executive_type = ?, status = ?';
         let params = [name, email, role, executive_type, status];
@@ -317,18 +344,21 @@ app.put('/api/users/:id', authenticateToken, requireAdmin, requireDB, async (req
         updateQuery += ' WHERE id = ?';
         params.push(id);
 
-        await db.execute(updateQuery, params);
+        await connection.execute(updateQuery, params);
 
         res.json({ message: 'User updated successfully' });
 
     } catch (error) {
         console.error('Update user error:', error);
         res.status(500).json({ error: 'Failed to update user' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
 // Report Routes
 app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.single('photo_proof'), async (req, res) => {
+    let connection;
     try {
         const {
             business_name,
@@ -347,7 +377,8 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
 
         const photo_path = req.file ? req.file.filename : null;
 
-        const [result] = await db.execute(`
+        connection = await pool.getConnection();
+        const [result] = await connection.execute(`
             INSERT INTO cold_calling_reports 
             (user_id, business_name, contact_person, contact_position, visit_time, photo_proof, outcome, notes, latitude, longitude, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
@@ -361,10 +392,13 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
     } catch (error) {
         console.error('Submit cold calling report error:', error);
         res.status(500).json({ error: 'Failed to submit report' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
 app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req, res) => {
+    let connection;
     try {
         const {
             business_name,
@@ -379,7 +413,8 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
             return res.status(400).json({ error: 'All required fields must be filled' });
         }
 
-        const [result] = await db.execute(`
+        connection = await pool.getConnection();
+        const [result] = await connection.execute(`
             INSERT INTO telemarketing_reports 
             (user_id, business_name, contact_person, contact_position, call_time, outcome, notes, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
@@ -393,11 +428,14 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
     } catch (error) {
         console.error('Submit telemarketing report error:', error);
         res.status(500).json({ error: 'Failed to submit report' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
 // Get reports (filtered by user role)
 app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
+    let connection;
     try {
         const { date_from, date_to, outcome, business_name } = req.query;
         let conditions = [];
@@ -428,8 +466,10 @@ app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
 
         const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
+        connection = await pool.getConnection();
+
         // Get cold calling reports
-        const [coldReports] = await db.execute(`
+        const [coldReports] = await connection.execute(`
             SELECT 
                 ccr.*,
                 u.name as user_name,
@@ -442,7 +482,7 @@ app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
         `, params);
 
         // Get telemarketing reports
-        const [teleReports] = await db.execute(`
+        const [teleReports] = await connection.execute(`
             SELECT 
                 tr.*,
                 u.name as user_name,
@@ -468,17 +508,22 @@ app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
     } catch (error) {
         console.error('Get reports error:', error);
         res.status(500).json({ error: 'Failed to fetch reports' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
 // Delete report (same day only for executives)
 app.delete('/api/reports/:type/:id', authenticateToken, requireDB, async (req, res) => {
+    let connection;
     try {
         const { type, id } = req.params;
         const table = type === 'cold_calling' ? 'cold_calling_reports' : 'telemarketing_reports';
 
+        connection = await pool.getConnection();
+
         // Check if report exists and belongs to user (or user is admin)
-        const [reports] = await db.execute(
+        const [reports] = await connection.execute(
             `SELECT * FROM ${table} WHERE id = ? ${req.user.role !== 'admin' ? 'AND user_id = ?' : ''}`,
             req.user.role !== 'admin' ? [id, req.user.id] : [id]
         );
@@ -507,24 +552,29 @@ app.delete('/api/reports/:type/:id', authenticateToken, requireDB, async (req, r
             }
         }
 
-        await db.execute(`DELETE FROM ${table} WHERE id = ?`, [id]);
+        await connection.execute(`DELETE FROM ${table} WHERE id = ?`, [id]);
 
         res.json({ message: 'Report deleted successfully' });
 
     } catch (error) {
         console.error('Delete report error:', error);
         res.status(500).json({ error: 'Failed to delete report' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
 // Dashboard statistics
 app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) => {
+    let connection;
     try {
         const userCondition = req.user.role !== 'admin' ? 'WHERE user_id = ?' : '';
         const userParam = req.user.role !== 'admin' ? [req.user.id] : [];
 
+        connection = await pool.getConnection();
+
         // Get cold calling stats
-        const [coldStats] = await db.execute(`
+        const [coldStats] = await connection.execute(`
             SELECT 
                 COUNT(*) as total_visits,
                 SUM(CASE WHEN outcome = 'Deal Closed' THEN 1 ELSE 0 END) as deals_closed,
@@ -534,7 +584,7 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
         `, userParam);
 
         // Get telemarketing stats  
-        const [teleStats] = await db.execute(`
+        const [teleStats] = await connection.execute(`
             SELECT 
                 COUNT(*) as total_calls,
                 SUM(CASE WHEN outcome = 'Deal Closed' THEN 1 ELSE 0 END) as deals_closed,
@@ -544,7 +594,7 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
         `, userParam);
 
         // Get weekly activity
-        const [weeklyActivity] = await db.execute(`
+        const [weeklyActivity] = await connection.execute(`
             SELECT 
                 DATE(created_at) as date,
                 COUNT(*) as count,
@@ -574,14 +624,19 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
     } catch (error) {
         console.error('Dashboard stats error:', error);
         res.status(500).json({ error: 'Failed to fetch dashboard statistics' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
 // Export reports as CSV (admin only)
 app.get('/api/reports/export', authenticateToken, requireAdmin, requireDB, async (req, res) => {
+    let connection;
     try {
+        connection = await pool.getConnection();
+
         // Get all reports with user information
-        const [allReports] = await db.execute(`
+        const [allReports] = await connection.execute(`
             SELECT 
                 'Cold Calling' as report_type,
                 u.name as executive_name,
@@ -651,6 +706,8 @@ app.get('/api/reports/export', authenticateToken, requireAdmin, requireDB, async
     } catch (error) {
         console.error('Export reports error:', error);
         res.status(500).json({ error: 'Failed to export reports' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
@@ -665,37 +722,23 @@ app.use((req, res) => {
     res.status(404).json({ error: 'Endpoint not found' });
 });
 
-// Initialize database and start server
-async function startServer() {
-    console.log('🚀 Starting Orbyte Sales API Server...');
-    console.log('Environment:', process.env.NODE_ENV || 'development');
-    
-    // Initialize database
-    await initDB();
-    
-    // Start server
-    app.listen(PORT, '0.0.0.0', () => {
-        console.log(`✅ Server running on port ${PORT}`);
-        console.log(`📡 Health check: http://localhost:${PORT}/api/health`);
-        console.log(`🌐 API Base URL: http://localhost:${PORT}/api`);
-    });
-}
-
 // Handle graceful shutdown
 process.on('SIGTERM', async () => {
     console.log('SIGTERM received, shutting down gracefully');
-    if (db) {
-        await db.end();
-    }
+    await pool.end();
     process.exit(0);
 });
 
 process.on('SIGINT', async () => {
     console.log('SIGINT received, shutting down gracefully');
-    if (db) {
-        await db.end();
-    }
+    await pool.end();
     process.exit(0);
 });
 
-startServer().catch(console.error);
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`📡 Health check: http://localhost:${PORT}/api/health`);
+    console.log(`🌐 API Base URL: http://localhost:${PORT}/api`);
+    console.log('Environment:', process.env.NODE_ENV || 'development');
+});
