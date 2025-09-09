@@ -15,10 +15,10 @@ const PORT = process.env.PORT || 10000;
 app.use(cors({
     origin: [
         'http://localhost:3000',
-        'https://team.orbyte360.com',           // Your actual subdomain
-        'https://orbyte360.com',                // Your main domain
-        'https://www.orbyte360.com',            // WWW version
-        'https://orbyte-sales-api.onrender.com' // Backend URL
+        'https://team.orbyte360.com',
+        'https://orbyte360.com',
+        'https://www.orbyte360.com',
+        'https://orbyte-sales-api.onrender.com'
     ],
     credentials: true
 }));
@@ -32,7 +32,7 @@ if (!fs.existsSync('uploads')) {
     fs.mkdirSync('uploads', { recursive: true });
 }
 
-// Database configuration - Using connection pool to fix "closed state" error
+// Database configuration
 const poolConfig = {
     host: process.env.DB_HOST || '193.203.168.132',
     user: process.env.DB_USER,
@@ -49,53 +49,24 @@ const poolConfig = {
     ssl: false
 };
 
-console.log('Database pool config:', {
-    host: poolConfig.host,
-    user: poolConfig.user,
-    database: poolConfig.database,
-    port: poolConfig.port,
-    connectionLimit: poolConfig.connectionLimit
-});
-
 // Create connection pool
 const pool = mysql.createPool(poolConfig);
 
-// Test database connection
+// Database connection status
 let dbConnectionStatus = 'unknown';
 
 async function testConnection() {
     try {
         const connection = await pool.getConnection();
         await connection.execute('SELECT 1 as test');
-        await connection.execute(`SELECT COUNT(*) as count FROM information_schema.tables WHERE table_schema = ?`, [poolConfig.database]);
         connection.release();
         
         dbConnectionStatus = 'connected';
-        console.log('✅ Database connection pool established successfully');
-        
-        // Test if required tables exist
-        const [tables] = await pool.execute(`
-            SELECT table_name FROM information_schema.tables 
-            WHERE table_schema = ? AND table_name IN ('users', 'cold_calling_reports', 'telemarketing_reports')
-        `, [poolConfig.database]);
-        
-        console.log('Available tables:', tables.map(t => t.table_name));
-        
-        if (tables.length === 3) {
-            console.log('✅ All required tables found');
-        } else {
-            console.log('⚠️ Some tables may be missing:', {
-                found: tables.length,
-                expected: 3,
-                tables: tables.map(t => t.table_name)
-            });
-        }
+        console.log('✅ Database connection established');
         
     } catch (error) {
         dbConnectionStatus = 'error: ' + error.message;
         console.error('❌ Database connection failed:', error.message);
-        
-        // Retry connection after delay
         setTimeout(testConnection, 10000);
     }
 }
@@ -160,13 +131,11 @@ app.get('/', (req, res) => {
         message: 'Orbyte Sales API Server',
         status: 'Running',
         version: '1.0.0',
-        database: dbConnectionStatus,
         endpoints: {
             health: '/api/health',
             login: '/api/auth/login',
-            resetPassword: '/api/admin/reset-password',
             reports: '/api/reports',
-            users: '/api/users (admin only)'
+            users: '/api/users'
         }
     });
 });
@@ -215,143 +184,49 @@ app.post('/api/auth/login', requireDB, async (req, res) => {
             return res.status(400).json({ error: 'Email and password are required' });
         }
 
-        console.log('=== LOGIN DEBUG ===');
-        console.log('Login attempt for:', email);
-        console.log('Password provided:', password);
-
         connection = await pool.getConnection();
         const [users] = await connection.execute(
             'SELECT * FROM users WHERE email = ? AND status = "active"',
             [email]
         );
 
-        console.log('Users found:', users.length);
-        if (users.length > 0) {
-            const user = users[0];
-            console.log('User found:', {
-                id: user.id,
-                email: user.email,
-                role: user.role,
-                status: user.status,
-                passwordHashLength: user.password.length,
-                passwordHashStart: user.password.substring(0, 10) + '...'
-            });
-
-            console.log('Testing password comparison...');
-            console.log('Password comparison:', {
-                inputPassword: password,
-                storedHash: user.password,
-                hashLength: user.password.length
-            });
-            
-            const isValidPassword = await bcrypt.compare(password, user.password);
-            console.log('Password comparison result:', isValidPassword);
-
-            if (!isValidPassword) {
-                console.log('Password comparison failed');
-                return res.status(401).json({ error: 'Invalid credentials' });
-            }
-
-            // If we get here, password is valid
-            console.log('✅ Login successful for:', email);
-            
-            const token = jwt.sign(
-                { 
-                    id: user.id, 
-                    email: user.email, 
-                    role: user.role,
-                    name: user.name,
-                    executive_type: user.executive_type
-                },
-                JWT_SECRET,
-                { expiresIn: '24h' }
-            );
-
-            res.json({
-                token,
-                user: {
-                    id: user.id,
-                    name: user.name,
-                    email: user.email,
-                    role: user.role,
-                    executive_type: user.executive_type
-                }
-            });
-
-        } else {
-            console.log('No user found with email:', email);
+        if (users.length === 0) {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
 
+        const user = users[0];
+        const isValidPassword = await bcrypt.compare(password, user.password);
+
+        if (!isValidPassword) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign(
+            { 
+                id: user.id, 
+                email: user.email, 
+                role: user.role,
+                name: user.name,
+                executive_type: user.executive_type
+            },
+            JWT_SECRET,
+            { expiresIn: '24h' }
+        );
+
+        res.json({
+            token,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                executive_type: user.executive_type
+            }
+        });
+
     } catch (error) {
         console.error('Login error:', error);
-        res.status(500).json({ error: 'Login failed: ' + error.message });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// Temporary password reset endpoint - generates hash with server's bcrypt
-app.post('/api/admin/reset-password', requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { email, newPassword } = req.body;
-        
-        if (!email || !newPassword) {
-            return res.status(400).json({ error: 'Email and new password are required' });
-        }
-        
-        console.log('=== PASSWORD RESET DEBUG ===');
-        console.log('Password reset request for:', email);
-        console.log('New password:', newPassword);
-        
-        // Generate hash using server's bcrypt version
-        const hashedPassword = await bcrypt.hash(newPassword, 10);
-        console.log('Generated hash:', hashedPassword);
-        console.log('Generated hash length:', hashedPassword.length);
-        
-        connection = await pool.getConnection();
-        
-        // Check if user exists first
-        const [users] = await connection.execute(
-            'SELECT id, email FROM users WHERE email = ?',
-            [email]
-        );
-        
-        if (users.length === 0) {
-            console.log('User not found:', email);
-            return res.status(404).json({ error: 'User not found' });
-        }
-        
-        console.log('User found, updating password...');
-        
-        const [result] = await connection.execute(
-            'UPDATE users SET `password` = ? WHERE email = ?',
-            [hashedPassword, email]
-        );
-        
-        console.log('Update result:', { affectedRows: result.affectedRows });
-        
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ error: 'Failed to update password' });
-        }
-        
-        console.log('✅ Password updated successfully for:', email);
-        
-        // Test the new hash immediately
-        console.log('Testing new hash with provided password...');
-        const testResult = await bcrypt.compare(newPassword, hashedPassword);
-        console.log('Hash test result:', testResult);
-        
-        res.json({ 
-            message: 'Password reset successfully',
-            hashLength: hashedPassword.length,
-            hashTest: testResult
-        });
-        
-    } catch (error) {
-        console.error('Password reset error:', error);
-        res.status(500).json({ error: 'Password reset failed: ' + error.message });
+        res.status(500).json({ error: 'Login failed' });
     } finally {
         if (connection) connection.release();
     }
@@ -805,7 +680,7 @@ app.get('/api/reports/export', authenticateToken, requireAdmin, requireDB, async
 // Error handling middleware
 app.use((err, req, res, next) => {
     console.error('Error:', err);
-    res.status(500).json({ error: 'Internal server error: ' + err.message });
+    res.status(500).json({ error: 'Internal server error' });
 });
 
 // 404 handler
@@ -828,9 +703,6 @@ process.on('SIGINT', async () => {
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Server running on port ${PORT}`);
-    console.log(`📡 Health check: http://localhost:${PORT}/api/health`);
-    console.log(`🌐 API Base URL: http://localhost:${PORT}/api`);
-    console.log(`🔧 Password Reset: POST http://localhost:${PORT}/api/admin/reset-password`);
-    console.log('Environment:', process.env.NODE_ENV || 'development');
+    console.log(`✅ Orbyte Sales API Server running on port ${PORT}`);
+    console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
