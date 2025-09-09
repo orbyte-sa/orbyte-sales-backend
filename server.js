@@ -164,6 +164,7 @@ app.get('/', (req, res) => {
         endpoints: {
             health: '/api/health',
             login: '/api/auth/login',
+            resetPassword: '/api/admin/reset-password',
             reports: '/api/reports',
             users: '/api/users (admin only)'
         }
@@ -214,7 +215,9 @@ app.post('/api/auth/login', requireDB, async (req, res) => {
             return res.status(400).json({ error: 'Email and password are required' });
         }
 
+        console.log('=== LOGIN DEBUG ===');
         console.log('Login attempt for:', email);
+        console.log('Password provided:', password);
 
         connection = await pool.getConnection();
         const [users] = await connection.execute(
@@ -222,51 +225,133 @@ app.post('/api/auth/login', requireDB, async (req, res) => {
             [email]
         );
 
-        if (users.length === 0) {
-            return res.status(401).json({ error: 'Invalid credentials' });
-        }
-
-        const user = users[0];
-        console.log('Password comparison:', {
-    inputPassword: password,
-    storedHash: user.password,
-    hashLength: user.password.length
-});
-const isValidPassword = await bcrypt.compare(password, user.password);
-console.log('Password valid:', isValidPassword);
-
-        if (!isValidPassword) {
-            return res.status(401).json({ error: 'Invalid credentials' });
-        }
-
-        const token = jwt.sign(
-            { 
-                id: user.id, 
-                email: user.email, 
-                role: user.role,
-                name: user.name,
-                executive_type: user.executive_type
-            },
-            JWT_SECRET,
-            { expiresIn: '24h' }
-        );
-
-        console.log('✅ Login successful for:', email);
-
-        res.json({
-            token,
-            user: {
+        console.log('Users found:', users.length);
+        if (users.length > 0) {
+            const user = users[0];
+            console.log('User found:', {
                 id: user.id,
-                name: user.name,
                 email: user.email,
                 role: user.role,
-                executive_type: user.executive_type
+                status: user.status,
+                passwordHashLength: user.password.length,
+                passwordHashStart: user.password.substring(0, 10) + '...'
+            });
+
+            console.log('Testing password comparison...');
+            console.log('Password comparison:', {
+                inputPassword: password,
+                storedHash: user.password,
+                hashLength: user.password.length
+            });
+            
+            const isValidPassword = await bcrypt.compare(password, user.password);
+            console.log('Password comparison result:', isValidPassword);
+
+            if (!isValidPassword) {
+                console.log('Password comparison failed');
+                return res.status(401).json({ error: 'Invalid credentials' });
             }
-        });
+
+            // If we get here, password is valid
+            console.log('✅ Login successful for:', email);
+            
+            const token = jwt.sign(
+                { 
+                    id: user.id, 
+                    email: user.email, 
+                    role: user.role,
+                    name: user.name,
+                    executive_type: user.executive_type
+                },
+                JWT_SECRET,
+                { expiresIn: '24h' }
+            );
+
+            res.json({
+                token,
+                user: {
+                    id: user.id,
+                    name: user.name,
+                    email: user.email,
+                    role: user.role,
+                    executive_type: user.executive_type
+                }
+            });
+
+        } else {
+            console.log('No user found with email:', email);
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
 
     } catch (error) {
         console.error('Login error:', error);
         res.status(500).json({ error: 'Login failed: ' + error.message });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// Temporary password reset endpoint - generates hash with server's bcrypt
+app.post('/api/admin/reset-password', requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { email, newPassword } = req.body;
+        
+        if (!email || !newPassword) {
+            return res.status(400).json({ error: 'Email and new password are required' });
+        }
+        
+        console.log('=== PASSWORD RESET DEBUG ===');
+        console.log('Password reset request for:', email);
+        console.log('New password:', newPassword);
+        
+        // Generate hash using server's bcrypt version
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        console.log('Generated hash:', hashedPassword);
+        console.log('Generated hash length:', hashedPassword.length);
+        
+        connection = await pool.getConnection();
+        
+        // Check if user exists first
+        const [users] = await connection.execute(
+            'SELECT id, email FROM users WHERE email = ?',
+            [email]
+        );
+        
+        if (users.length === 0) {
+            console.log('User not found:', email);
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        console.log('User found, updating password...');
+        
+        const [result] = await connection.execute(
+            'UPDATE users SET `password` = ? WHERE email = ?',
+            [hashedPassword, email]
+        );
+        
+        console.log('Update result:', { affectedRows: result.affectedRows });
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Failed to update password' });
+        }
+        
+        console.log('✅ Password updated successfully for:', email);
+        
+        // Test the new hash immediately
+        console.log('Testing new hash with provided password...');
+        const testResult = await bcrypt.compare(newPassword, hashedPassword);
+        console.log('Hash test result:', testResult);
+        
+        res.json({ 
+            message: 'Password reset successfully',
+            hashLength: hashedPassword.length,
+            hashTest: testResult
+        });
+        
+    } catch (error) {
+        console.error('Password reset error:', error);
+        res.status(500).json({ error: 'Password reset failed: ' + error.message });
     } finally {
         if (connection) connection.release();
     }
@@ -313,7 +398,7 @@ app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, r
         const hashedPassword = await bcrypt.hash(password, 10);
 
         const [result] = await connection.execute(
-            'INSERT INTO users (name, email, password, role, executive_type, status) VALUES (?, ?, ?, ?, ?, "active")',
+            'INSERT INTO users (name, email, `password`, role, executive_type, status) VALUES (?, ?, ?, ?, ?, "active")',
             [name, email, hashedPassword, role, executive_type]
         );
 
@@ -343,7 +428,7 @@ app.put('/api/users/:id', authenticateToken, requireAdmin, requireDB, async (req
 
         if (password) {
             const hashedPassword = await bcrypt.hash(password, 10);
-            updateQuery += ', password = ?';
+            updateQuery += ', `password` = ?';
             params.push(hashedPassword);
         }
 
@@ -746,5 +831,6 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Server running on port ${PORT}`);
     console.log(`📡 Health check: http://localhost:${PORT}/api/health`);
     console.log(`🌐 API Base URL: http://localhost:${PORT}/api`);
+    console.log(`🔧 Password Reset: POST http://localhost:${PORT}/api/admin/reset-password`);
     console.log('Environment:', process.env.NODE_ENV || 'development');
 });
