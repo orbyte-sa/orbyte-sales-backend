@@ -1349,207 +1349,96 @@ app.put('/api/notifications/:id/read', authenticateToken, requireDB, async (req,
 // ENHANCED REPORT ROUTES - FIXED
 // =============================================================================
 
-app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.single('photo_proof'), async (req, res) => {
-    let connection;
+// POST a new cold calling report
+app.post('/api/reports/cold-calling', [authenticateToken, upload.single('photo_proof')], async (req, res) => {
     try {
         const {
-            business_name, contact_person, contact_position, contact_phone, contact_email, visit_time, outcome, notes,
-            latitude, longitude, business_id, follow_up_required, follow_up_date
+            business_name,
+            business_id,
+            contact_person,
+            contact_position,
+            contact_phone,
+            contact_email,
+            visit_time,
+            outcome,
+            notes,
+            latitude,
+            longitude,
+            follow_up_required,
+            follow_up_date
         } = req.body;
 
-        if (!business_name || !contact_person || !contact_position || !visit_time || !outcome) {
-            return res.status(400).json({ error: 'All required fields must be filled' });
-        }
+        const userId = req.user.id;
+        const photo_proof = req.file ? req.file.filename : null;
 
-        // Convert datetime-local to MySQL datetime format
-        const visitDateTime = new Date(visit_time).toISOString().slice(0, 19).replace('T', ' ');
-        const photo_path = req.file ? req.file.filename : null;
-
-        connection = await pool.getConnection();
-        
-        // Start transaction
-        await connection.execute('START TRANSACTION');
-
-        // Handle business_id validation - if provided, check if it exists
-        let validBusinessId = null;
-        if (business_id && business_id !== '' && business_id !== 'null') {
-            const [businessCheck] = await connection.execute(
-                'SELECT id FROM businesses WHERE id = ?', 
-                [business_id]
-            );
-            if (businessCheck.length > 0) {
-                validBusinessId = business_id;
-            }
-        }
-
-        const [result] = await connection.execute(`
+        // This SQL query has the correct number of columns and value placeholders (15 and 15)
+        const sql = `
             INSERT INTO cold_calling_reports 
-            (user_id, business_name, contact_person, contact_position, contact_phone, contact_email, visit_time, 
-             photo_proof, outcome, notes, latitude, longitude, business_id, 
-             follow_up_required, follow_up_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-        `, [
-            req.user.id, 
-            business_name, 
-            contact_person, 
-            contact_position, 
-            contact_phone, 
-            contact_email,
-            visitDateTime, 
-            photo_path, 
-            outcome, 
-            notes || null, 
-            latitude || null, 
-            longitude || null, 
-            validBusinessId,  // This fixes the foreign key constraint error
-            follow_up_required === 'true', 
-            follow_up_date || null
-        ]);
+            (user_id, business_name, business_id, contact_person, contact_position, contact_phone, contact_email, visit_time, outcome, notes, latitude, longitude, photo_proof, follow_up_required, follow_up_date) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+        
+        // This array provides the correct number of values
+        const values = [
+            userId, business_name, business_id || null, contact_person, contact_position, 
+            contact_phone, contact_email,
+            visit_time, outcome, notes, latitude || null, longitude || null, photo_proof, 
+            follow_up_required === 'true', follow_up_date || null
+        ];
 
-        // Add to business interactions only if we have a valid business_id
-        if (validBusinessId) {
-            await connection.execute(`
-                INSERT INTO business_interactions 
-                (business_id, user_id, interaction_type, outcome, notes, interaction_date)
-                VALUES (?, ?, 'cold_call', ?, ?, ?)
-            `, [validBusinessId, req.user.id, outcome, notes || null, visitDateTime]);
-
-            // Update business status if deal closed
-            if (outcome === 'Deal Closed') {
-                await connection.execute(
-                    'UPDATE businesses SET status = "Deal Closed" WHERE id = ?',
-                    [validBusinessId]
-                );
-            }
-        }
-
-        // Create follow-up if required and we have a valid business_id
-        if (follow_up_required === 'true' && follow_up_date && validBusinessId) {
-            await connection.execute(`
-                INSERT INTO follow_ups 
-                (business_id, user_id, report_id, report_type, follow_up_type, scheduled_date, notes)
-                VALUES (?, ?, ?, 'cold_calling', 'call', ?, 'Follow-up from cold calling visit')
-            `, [validBusinessId, req.user.id, result.insertId, follow_up_date]);
-        }
-
-        // Update goals progress
-        await updateGoalProgress(connection, req.user.id, 'cold_calling', outcome);
-
-        await connection.execute('COMMIT');
-
-        res.json({ 
-            id: result.insertId, 
-            message: 'Cold calling report submitted successfully' 
-        });
+        await pool.query(sql, values);
+        res.status(201).json({ message: 'Cold calling report created successfully' });
 
     } catch (error) {
-        if (connection) await connection.execute('ROLLBACK');
-        console.error('Submit cold calling report error:', error);
-        res.status(500).json({ error: 'Failed to submit report' });
-    } finally {
-        if (connection) connection.release();
+        console.error('Error creating cold calling report:', error);
+        res.status(500).json({ error: 'Failed to create report' });
     }
 });
-
 
 // =============================================================================
 // FIXED TELEMARKETING REPORT ROUTE - Replace existing one
 // =============================================================================
 
-app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req, res) => {
-    let connection;
+// POST a new telemarketing report
+app.post('/api/reports/telemarketing', authenticateToken, async (req, res) => {
     try {
         const {
-            business_name, contact_person, contact_position, contact_phone, contact_email, call_time, outcome, notes,
-            business_id, follow_up_required, follow_up_date
-        } = req.body;
-
-        if (!business_name || !contact_person || !contact_position || !call_time || !outcome) {
-            return res.status(400).json({ error: 'All required fields must be filled' });
-        }
-
-        // Convert datetime-local to MySQL datetime format
-        const callDateTime = new Date(call_time).toISOString().slice(0, 19).replace('T', ' ');
-
-        connection = await pool.getConnection();
-        
-        // Start transaction
-        await connection.execute('START TRANSACTION');
-
-        // Handle business_id validation - if provided, check if it exists
-        let validBusinessId = null;
-        if (business_id && business_id !== '' && business_id !== 'null') {
-            const [businessCheck] = await connection.execute(
-                'SELECT id FROM businesses WHERE id = ?', 
-                [business_id]
-            );
-            if (businessCheck.length > 0) {
-                validBusinessId = business_id;
-            }
-        }
-
-        const [result] = await connection.execute(`
-            INSERT INTO telemarketing_reports 
-            (user_id, business_name, contact_person, contact_position, contact_phone, contact_email, call_time, 
-             outcome, notes, business_id, follow_up_required, follow_up_date, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-        `, [
-            req.user.id, 
-            business_name, 
-            contact_person, 
+            business_name,
+            business_id,
+            contact_person,
             contact_position,
-            contact_phone, 
-            contact_email,
-            callDateTime, 
-            outcome, 
-            notes || null, 
-            validBusinessId,  // This fixes the foreign key constraint error
-            follow_up_required === 'true', 
-            follow_up_date || null
-        ]);
+            contact_phone,         // <-- ADD THIS
+            contact_email,         // <-- ADD THIS
+            call_time,
+            outcome,
+            notes,
+            follow_up_required,
+            follow_up_date
+        } = req.body;
+        
+        const userId = req.user.id;
 
-        // Add to business interactions only if we have a valid business_id
-        if (validBusinessId) {
-            await connection.execute(`
-                INSERT INTO business_interactions 
-                (business_id, user_id, interaction_type, outcome, notes, interaction_date)
-                VALUES (?, ?, 'telemarketing', ?, ?, ?)
-            `, [validBusinessId, req.user.id, outcome, notes || null, callDateTime]);
+        // SQL query is modified to include the new columns
+        const sql = `
+            INSERT INTO telemarketing_reports 
+            (user_id, business_name, business_id, contact_person, contact_position, contact_phone, contact_email, call_time, outcome, notes, follow_up_required, follow_up_date) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+        
+        // Values array is modified to include the new data
+        const values = [
+            userId, business_name, business_id || null, contact_person, contact_position, 
+            contact_phone, contact_email, // <-- ADD THESE
+            call_time, outcome, notes, 
+            follow_up_required === 'true', follow_up_date || null
+        ];
 
-            // Update business status if deal closed
-            if (outcome === 'Deal Closed') {
-                await connection.execute(
-                    'UPDATE businesses SET status = "Deal Closed" WHERE id = ?',
-                    [validBusinessId]
-                );
-            }
-        }
-
-        // Create follow-up if required and we have a valid business_id
-        if (follow_up_required === 'true' && follow_up_date && validBusinessId) {
-            await connection.execute(`
-                INSERT INTO follow_ups 
-                (business_id, user_id, report_id, report_type, follow_up_type, scheduled_date, notes)
-                VALUES (?, ?, ?, 'telemarketing', 'call', ?, 'Follow-up from telemarketing call')
-            `, [validBusinessId, req.user.id, result.insertId, follow_up_date]);
-        }
-
-        // Update goals progress
-        await updateGoalProgress(connection, req.user.id, 'telemarketing', outcome);
-
-        await connection.execute('COMMIT');
-
-        res.json({ 
-            id: result.insertId, 
-            message: 'Telemarketing report submitted successfully' 
-        });
+        await pool.query(sql, values);
+        res.status(201).json({ message: 'Telemarketing report created successfully' });
 
     } catch (error) {
-        if (connection) await connection.execute('ROLLBACK');
-        console.error('Submit telemarketing report error:', error);
-        res.status(500).json({ error: 'Failed to submit report' });
-    } finally {
-        if (connection) connection.release();
+        console.error('Error creating telemarketing report:', error);
+        res.status(500).json({ error: 'Failed to create report' });
     }
 });
 
