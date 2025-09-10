@@ -919,6 +919,7 @@ app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
 // ENHANCED REPORT ROUTES - Add detailed view for management
 // =============================================================================
 
+
 // Get single report with full details
 app.get('/api/reports/:type/:id', authenticateToken, requireDB, async (req, res) => {
     let connection;
@@ -959,19 +960,9 @@ app.get('/api/reports/:type/:id', authenticateToken, requireDB, async (req, res)
             ORDER BY scheduled_date DESC
         `, [id, type]);
 
-        // Get business interactions for this report
-        const [interactions] = await connection.execute(`
-            SELECT bi.*, u.name as user_name
-            FROM business_interactions bi
-            LEFT JOIN users u ON bi.user_id = u.id
-            WHERE bi.business_id = ? AND DATE(bi.interaction_date) = DATE(?)
-            ORDER BY bi.interaction_date DESC
-        `, [report.business_id, report.activity_time]);
-
         res.json({
             ...report,
-            follow_ups: followUps,
-            business_interactions: interactions
+            follow_ups: followUps
         });
 
     } catch (error) {
