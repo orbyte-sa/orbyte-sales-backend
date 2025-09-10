@@ -247,7 +247,7 @@ app.post('/api/auth/login', requireDB, async (req, res) => {
 });
 
 // =============================================================================
-// USER MANAGEMENT ROUTES
+// USER MANAGEMENT ROUTES - FIXED
 // =============================================================================
 
 app.get('/api/users', authenticateToken, requireAdmin, requireDB, async (req, res) => {
@@ -276,6 +276,16 @@ app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, r
 
         if (!name || !email || !password || !role) {
             return res.status(400).json({ error: 'Name, email, password, and role are required' });
+        }
+
+        // Validate role
+        if (!['admin', 'user'].includes(role)) {
+            return res.status(400).json({ error: 'Invalid role. Must be admin or user.' });
+        }
+
+        // Validate executive_type if provided
+        if (executive_type && !['indoor', 'outdoor'].includes(executive_type)) {
+            return res.status(400).json({ error: 'Invalid executive type. Must be indoor or outdoor.' });
         }
 
         connection = await pool.getConnection();
@@ -315,6 +325,16 @@ app.put('/api/users/:id', authenticateToken, requireAdmin, requireDB, async (req
     try {
         const { id } = req.params;
         const { name, email, role, executive_type, department, phone, status, password } = req.body;
+
+        // Validate role
+        if (role && !['admin', 'user'].includes(role)) {
+            return res.status(400).json({ error: 'Invalid role. Must be admin or user.' });
+        }
+
+        // Validate executive_type if provided
+        if (executive_type && !['indoor', 'outdoor'].includes(executive_type)) {
+            return res.status(400).json({ error: 'Invalid executive type. Must be indoor or outdoor.' });
+        }
 
         connection = await pool.getConnection();
 
@@ -664,6 +684,40 @@ app.post('/api/goals', authenticateToken, requireDB, async (req, res) => {
     }
 });
 
+app.put('/api/goals/:id', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { id } = req.params;
+        const { goal_type, activity_type, target_value, start_date, end_date, status } = req.body;
+
+        connection = await pool.getConnection();
+
+        // Check permissions
+        if (req.user.role !== 'admin') {
+            const [goal] = await connection.execute(
+                'SELECT user_id FROM goals WHERE id = ?', [id]
+            );
+            if (goal.length === 0 || goal[0].user_id !== req.user.id) {
+                return res.status(403).json({ error: 'Access denied' });
+            }
+        }
+
+        await connection.execute(`
+            UPDATE goals 
+            SET goal_type = ?, activity_type = ?, target_value = ?, start_date = ?, end_date = ?, status = ?
+            WHERE id = ?
+        `, [goal_type, activity_type, target_value, start_date, end_date, status, id]);
+
+        res.json({ message: 'Goal updated successfully' });
+
+    } catch (error) {
+        console.error('Update goal error:', error);
+        res.status(500).json({ error: 'Failed to update goal' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
 // =============================================================================
 // TASKS AND ASSIGNMENTS ROUTES
 // =============================================================================
@@ -759,7 +813,7 @@ app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
     let connection;
     try {
         const { id } = req.params;
-        const { status, notes } = req.body;
+        const { status, notes, title, description, priority, due_date } = req.body;
 
         connection = await pool.getConnection();
 
@@ -778,12 +832,47 @@ app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
         }
 
         const completedAt = status === 'completed' ? 'NOW()' : 'NULL';
+        
+        // Build dynamic update query based on provided fields
+        let updateFields = [];
+        let params = [];
+        
+        if (status !== undefined) {
+            updateFields.push('status = ?');
+            params.push(status);
+        }
+        if (notes !== undefined) {
+            updateFields.push('notes = ?');
+            params.push(notes);
+        }
+        if (title !== undefined) {
+            updateFields.push('title = ?');
+            params.push(title);
+        }
+        if (description !== undefined) {
+            updateFields.push('description = ?');
+            params.push(description);
+        }
+        if (priority !== undefined) {
+            updateFields.push('priority = ?');
+            params.push(priority);
+        }
+        if (due_date !== undefined) {
+            updateFields.push('due_date = ?');
+            params.push(due_date);
+        }
+        
+        if (status === 'completed') {
+            updateFields.push('completed_at = NOW()');
+        }
+        
+        params.push(id);
 
         await connection.execute(`
             UPDATE tasks 
-            SET status = ?, notes = ?, completed_at = ${completedAt}
+            SET ${updateFields.join(', ')}
             WHERE id = ?
-        `, [status, notes, id]);
+        `, params);
 
         res.json({ message: 'Task updated successfully' });
 
@@ -842,7 +931,7 @@ app.put('/api/notifications/:id/read', authenticateToken, requireDB, async (req,
 });
 
 // =============================================================================
-// ENHANCED REPORT ROUTES
+// ENHANCED REPORT ROUTES - FIXED
 // =============================================================================
 
 app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.single('photo_proof'), async (req, res) => {
@@ -998,56 +1087,111 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
     }
 });
 
-// =============================================================================
-// FIXED USER MANAGEMENT - Update role handling
-// =============================================================================
-
-app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, res) => {
+// Enhanced Get reports with advanced filtering
+app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
     let connection;
     try {
-        const { name, email, password, role, executive_type, department, phone } = req.body;
+        const { 
+            date_from, date_to, outcome, business_name, contact_person, 
+            report_type, user_id, business_id, page = 1, limit = 50
+        } = req.query;
+        
+        let conditions = [];
+        let params = [];
 
-        if (!name || !email || !password || !role) {
-            return res.status(400).json({ error: 'Name, email, password, and role are required' });
+        // If not admin, only show user's own reports
+        if (req.user.role !== 'admin') {
+            conditions.push('user_id = ?');
+            params.push(req.user.id);
+        } else if (user_id) {
+            conditions.push('user_id = ?');
+            params.push(user_id);
         }
 
-        // Validate role
-        if (!['admin', 'user'].includes(role)) {
-            return res.status(400).json({ error: 'Invalid role. Must be admin or user.' });
+        if (date_from) {
+            conditions.push('DATE(created_at) >= ?');
+            params.push(date_from);
+        }
+        if (date_to) {
+            conditions.push('DATE(created_at) <= ?');
+            params.push(date_to);
+        }
+        if (outcome) {
+            conditions.push('outcome = ?');
+            params.push(outcome);
+        }
+        if (business_name) {
+            conditions.push('business_name LIKE ?');
+            params.push(`%${business_name}%`);
+        }
+        if (contact_person) {
+            conditions.push('contact_person LIKE ?');
+            params.push(`%${contact_person}%`);
+        }
+        if (business_id) {
+            conditions.push('business_id = ?');
+            params.push(business_id);
         }
 
-        // Validate executive_type if provided
-        if (executive_type && !['indoor', 'outdoor'].includes(executive_type)) {
-            return res.status(400).json({ error: 'Invalid executive type. Must be indoor or outdoor.' });
-        }
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+        const offset = (page - 1) * limit;
 
         connection = await pool.getConnection();
 
-        // Check if user already exists
-        const [existingUsers] = await connection.execute(
-            'SELECT id FROM users WHERE email = ?',
-            [email]
-        );
+        let query = `
+            SELECT * FROM comprehensive_reports
+            ${whereClause}
+        `;
 
-        if (existingUsers.length > 0) {
-            return res.status(400).json({ error: 'User with this email already exists' });
+        if (report_type) {
+            if (whereClause) {
+                query += ' AND report_type = ?';
+            } else {
+                query += ' WHERE report_type = ?';
+            }
+            params.push(report_type);
         }
 
-        const hashedPassword = await bcrypt.hash(password, 10);
+        query += `
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        `;
+        params.push(parseInt(limit), offset);
 
-        const [result] = await connection.execute(`
-            INSERT INTO users (name, email, \`password\`, role, executive_type, department, phone, hire_date, status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, CURDATE(), "active")
-        `, [name, email, hashedPassword, role, executive_type || null, department || 'Sales', phone || null]);
+        const [reports] = await connection.execute(query, params);
 
-        res.json({ 
-            id: result.insertId, 
-            message: 'User created successfully' 
+        // Get total count for pagination
+        let countQuery = `
+            SELECT COUNT(*) as total FROM comprehensive_reports
+            ${whereClause}
+        `;
+        let countParams = [...params.slice(0, -2)]; // Remove limit and offset
+
+        if (report_type) {
+            if (whereClause) {
+                countQuery += ' AND report_type = ?';
+            } else {
+                countQuery += ' WHERE report_type = ?';
+            }
+            countParams.push(report_type);
+        }
+
+        const [countResult] = await connection.execute(countQuery, countParams);
+        const total = countResult[0].total;
+
+        res.json({
+            reports,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / limit)
+            }
         });
 
     } catch (error) {
-        console.error('Create user error:', error);
-        res.status(500).json({ error: 'Failed to create user' });
+        console.error('Get reports error:', error);
+        res.status(500).json({ error: 'Failed to fetch reports' });
     } finally {
         if (connection) connection.release();
     }
@@ -1210,7 +1354,6 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
     try {
         const userCondition = req.user.role !== 'admin' ? 'WHERE user_id = ?' : '';
         const userParam = req.user.role !== 'admin' ? [req.user.id] : [];
-        const dateFilter = 'AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)';
 
         connection = await pool.getConnection();
 
@@ -1233,20 +1376,19 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
             ${userCondition}
         `, userParam);
         
-        // NEW: Query for weekly activity chart
+        // Query for weekly activity chart
         const [weeklyActivity] = await connection.execute(`
             (SELECT 'cold_calling' as type, DATE(created_at) as date, COUNT(*) as count 
              FROM cold_calling_reports 
-             ${userCondition.replace('WHERE', 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND')}
+             ${userCondition ? 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND user_id = ?' : 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)'}
              GROUP BY DATE(created_at))
             UNION ALL
             (SELECT 'telemarketing' as type, DATE(created_at) as date, COUNT(*) as count 
              FROM telemarketing_reports 
-             ${userCondition.replace('WHERE', 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND')}
+             ${userCondition ? 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND user_id = ?' : 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)'}
              GROUP BY DATE(created_at))
             ORDER BY date DESC
         `, [...userParam, ...userParam]);
-        
 
         // Get goals progress
         const [goalsProgress] = await connection.execute(`
@@ -1299,12 +1441,12 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
         `, [req.user.id]);
 
         res.json({
-            coldCalling: coldStats[0] || { total_visits: 0, deals_closed: 0, today_visits: 0, week_visits: 0 },
-            telemarketing: teleStats[0] || { total_calls: 0, deals_closed: 0, today_calls: 0, week_calls: 0 },
+            coldCalling: coldStats[0] || { total_visits: 0, deals_closed: 0, today_visits: 0 },
+            telemarketing: teleStats[0] || { total_calls: 0, deals_closed: 0, today_calls: 0 },
             goals: goalsProgress,
             tasks: taskStats[0] || { total_tasks: 0, pending_tasks: 0, in_progress_tasks: 0, due_today: 0 },
             followUps: followUpStats[0] || { total_followups: 0, scheduled_followups: 0, due_today: 0 },
-            weeklyActivity: weeklyActivity // ADD THIS LINE
+            weeklyActivity: weeklyActivity
         });
 
     } catch (error) {
@@ -1314,6 +1456,7 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
         if (connection) connection.release();
     }
 });
+
 // =============================================================================
 // UTILITY FUNCTIONS
 // =============================================================================
@@ -1366,10 +1509,6 @@ async function updateGoalProgress(connection, userId, activityType, outcome) {
         console.error('Error updating goal progress:', error);
     }
 }
-
-// =============================================================================
-// EXISTING ROUTES (ENHANCED)
-// =============================================================================
 
 // Delete report (enhanced with business interaction cleanup)
 app.delete('/api/reports/:type/:id', authenticateToken, requireDB, async (req, res) => {
@@ -1534,7 +1673,7 @@ process.on('SIGINT', async () => {
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Orbyte Sales API Server running on port ${PORT}`);
-    console.log(`🌐 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 // =============================================================================
