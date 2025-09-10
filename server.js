@@ -397,6 +397,70 @@ app.delete('/api/users/:id', authenticateToken, requireAdmin, requireDB, async (
     }
 });
 
+// GET Calendar Events (Tasks and Follow-ups)
+app.get('/api/calendar/events', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userRole = req.user.role;
+
+        // Base queries for tasks and follow-ups
+        const tasksQuery = `
+            SELECT 
+                t.id, 
+                t.title, 
+                t.due_date as start, 
+                'task' as type,
+                t.description,
+                u.name as userName,
+                b.business_name as businessName
+            FROM tasks t
+            LEFT JOIN users u ON t.assigned_to = u.id
+            LEFT JOIN businesses b ON t.business_id = b.id
+            WHERE t.due_date IS NOT NULL
+        `;
+
+        const followUpsQuery = `
+            SELECT 
+                r.id, 
+                CONCAT('Follow-up: ', r.business_name) as title, 
+                r.follow_up_date as start, 
+                'follow-up' as type,
+                r.notes as description,
+                u.name as userName,
+                b.business_name as businessName
+            FROM (
+                SELECT id, user_id, business_id, business_name, follow_up_date, notes FROM cold_calling_reports WHERE follow_up_date IS NOT NULL
+                UNION ALL
+                SELECT id, user_id, business_id, business_name, follow_up_date, notes FROM telemarketing_reports WHERE follow_up_date IS NOT NULL
+            ) as r
+            LEFT JOIN users u ON r.user_id = u.id
+            LEFT JOIN businesses b ON r.business_id = b.id
+        `;
+        
+        let finalQuery;
+        let queryParams = [];
+
+        // Admins see all events, users see only their own
+        if (userRole === 'admin') {
+            finalQuery = `${tasksQuery} UNION ALL ${followUpsQuery}`;
+        } else {
+            finalQuery = `
+                SELECT * FROM (${tasksQuery} AND t.assigned_to = ?) AS user_tasks
+                UNION ALL
+                SELECT * FROM (${followUpsQuery} AND r.user_id = ?) AS user_followups
+            `;
+            queryParams.push(userId, userId);
+        }
+
+        const [events] = await pool.query(finalQuery, queryParams);
+        res.json(events);
+
+    } catch (error) {
+        console.error('Error fetching calendar events:', error);
+        res.status(500).json({ error: 'Failed to fetch calendar events' });
+    }
+});
+
 // =============================================================================
 // BUSINESS MANAGEMENT ROUTES
 // =============================================================================
