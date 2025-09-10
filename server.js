@@ -1260,6 +1260,7 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
     try {
         const userCondition = req.user.role !== 'admin' ? 'WHERE user_id = ?' : '';
         const userParam = req.user.role !== 'admin' ? [req.user.id] : [];
+        const dateFilter = 'AND created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)';
 
         connection = await pool.getConnection();
 
@@ -1268,8 +1269,7 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
             SELECT 
                 COUNT(*) as total_visits,
                 SUM(CASE WHEN outcome = 'Deal Closed' THEN 1 ELSE 0 END) as deals_closed,
-                SUM(CASE WHEN DATE(created_at) = CURDATE() THEN 1 ELSE 0 END) as today_visits,
-                SUM(CASE WHEN DATE(created_at) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) THEN 1 ELSE 0 END) as week_visits
+                SUM(CASE WHEN DATE(created_at) = CURDATE() THEN 1 ELSE 0 END) as today_visits
             FROM cold_calling_reports 
             ${userCondition}
         `, userParam);
@@ -1278,11 +1278,25 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
             SELECT 
                 COUNT(*) as total_calls,
                 SUM(CASE WHEN outcome = 'Deal Closed' THEN 1 ELSE 0 END) as deals_closed,
-                SUM(CASE WHEN DATE(created_at) = CURDATE() THEN 1 ELSE 0 END) as today_calls,
-                SUM(CASE WHEN DATE(created_at) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) THEN 1 ELSE 0 END) as week_calls
+                SUM(CASE WHEN DATE(created_at) = CURDATE() THEN 1 ELSE 0 END) as today_calls
             FROM telemarketing_reports 
             ${userCondition}
         `, userParam);
+        
+        // NEW: Query for weekly activity chart
+        const [weeklyActivity] = await connection.execute(`
+            (SELECT 'cold_calling' as type, DATE(created_at) as date, COUNT(*) as count 
+             FROM cold_calling_reports 
+             ${userCondition.replace('WHERE', 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND')}
+             GROUP BY DATE(created_at))
+            UNION ALL
+            (SELECT 'telemarketing' as type, DATE(created_at) as date, COUNT(*) as count 
+             FROM telemarketing_reports 
+             ${userCondition.replace('WHERE', 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND')}
+             GROUP BY DATE(created_at))
+            ORDER BY date DESC
+        `, [...userParam, ...userParam]);
+        
 
         // Get goals progress
         const [goalsProgress] = await connection.execute(`
@@ -1339,7 +1353,8 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
             telemarketing: teleStats[0] || { total_calls: 0, deals_closed: 0, today_calls: 0, week_calls: 0 },
             goals: goalsProgress,
             tasks: taskStats[0] || { total_tasks: 0, pending_tasks: 0, in_progress_tasks: 0, due_today: 0 },
-            followUps: followUpStats[0] || { total_followups: 0, scheduled_followups: 0, due_today: 0 }
+            followUps: followUpStats[0] || { total_followups: 0, scheduled_followups: 0, due_today: 0 },
+            weeklyActivity: weeklyActivity // ADD THIS LINE
         });
 
     } catch (error) {
@@ -1349,7 +1364,6 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
         if (connection) connection.release();
     }
 });
-
 // =============================================================================
 // UTILITY FUNCTIONS
 // =============================================================================
