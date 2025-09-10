@@ -62,11 +62,11 @@ async function testConnection() {
         connection.release();
         
         dbConnectionStatus = 'connected';
-        console.log('✅ Database connection established');
+        console.log('âœ… Database connection established');
         
     } catch (error) {
         dbConnectionStatus = 'error: ' + error.message;
-        console.error('❌ Database connection failed:', error.message);
+        console.error('âŒ Database connection failed:', error.message);
         setTimeout(testConnection, 10000);
     }
 }
@@ -2070,8 +2070,8 @@ process.on('SIGINT', async () => {
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Orbyte Sales API Server running on port ${PORT}`);
-    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+    console.log(`âœ… Orbyte Sales API Server running on port ${PORT}`);
+    console.log(`ðŸŒ Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
 // =============================================================================
