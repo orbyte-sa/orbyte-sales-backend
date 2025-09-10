@@ -764,10 +764,10 @@ app.get('/api/tasks', authenticateToken, requireDB, async (req, res) => {
             params.push(status);
         }
 
-        // Non-admin users only see their assigned tasks
+        // FIXED: Users can see tasks assigned TO them OR assigned BY them
         if (req.user.role !== 'admin') {
-            conditions.push('t.assigned_to = ?');
-            params.push(req.user.id);
+            conditions.push('(t.assigned_to = ? OR t.assigned_by = ?)');
+            params.push(req.user.id, req.user.id);
         } else if (assigned_to) {
             conditions.push('t.assigned_to = ?');
             params.push(assigned_to);
@@ -798,6 +798,7 @@ app.get('/api/tasks', authenticateToken, requireDB, async (req, res) => {
         if (connection) connection.release();
     }
 });
+
 
 app.post('/api/tasks', authenticateToken, requireDB, async (req, res) => {
     let connection;
@@ -909,6 +910,335 @@ app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
     } catch (error) {
         console.error('Update task error:', error);
         res.status(500).json({ error: 'Failed to update task' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// =============================================================================
+// ENHANCED REPORT ROUTES - Add detailed view for management
+// =============================================================================
+
+// Get single report with full details
+app.get('/api/reports/:type/:id', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { type, id } = req.params;
+        
+        if (!['cold_calling', 'telemarketing'].includes(type)) {
+            return res.status(400).json({ error: 'Invalid report type' });
+        }
+
+        connection = await pool.getConnection();
+        
+        const [reports] = await connection.execute(`
+            SELECT cr.*, u.name as user_name, u.department, u.executive_type,
+                   b.business_name as linked_business_name, b.contact_person as linked_contact_person,
+                   b.phone as linked_phone, b.email as linked_email, b.address as linked_address
+            FROM comprehensive_reports cr
+            LEFT JOIN users u ON cr.user_id = u.id
+            LEFT JOIN businesses b ON cr.business_id = b.id
+            WHERE cr.report_type = ? AND cr.id = ?
+        `, [type, id]);
+
+        if (reports.length === 0) {
+            return res.status(404).json({ error: 'Report not found' });
+        }
+
+        const report = reports[0];
+
+        // Check permissions - admin can see all, users can see their own
+        if (req.user.role !== 'admin' && report.user_id !== req.user.id) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        // Get follow-ups for this report
+        const [followUps] = await connection.execute(`
+            SELECT * FROM follow_ups 
+            WHERE report_id = ? AND report_type = ?
+            ORDER BY scheduled_date DESC
+        `, [id, type]);
+
+        // Get business interactions for this report
+        const [interactions] = await connection.execute(`
+            SELECT bi.*, u.name as user_name
+            FROM business_interactions bi
+            LEFT JOIN users u ON bi.user_id = u.id
+            WHERE bi.business_id = ? AND DATE(bi.interaction_date) = DATE(?)
+            ORDER BY bi.interaction_date DESC
+        `, [report.business_id, report.activity_time]);
+
+        res.json({
+            ...report,
+            follow_ups: followUps,
+            business_interactions: interactions
+        });
+
+    } catch (error) {
+        console.error('Get report details error:', error);
+        res.status(500).json({ error: 'Failed to fetch report details' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// Enhanced reports list with more details for management
+app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { 
+            date_from, date_to, outcome, business_name, contact_person, 
+            report_type, user_id, business_id, page = 1, limit = 50
+        } = req.query;
+        
+        let conditions = [];
+        let params = [];
+
+        // If not admin, only show user's own reports
+        if (req.user.role !== 'admin') {
+            conditions.push('user_id = ?');
+            params.push(req.user.id);
+        } else if (user_id) {
+            conditions.push('user_id = ?');
+            params.push(user_id);
+        }
+
+        if (date_from) {
+            conditions.push('DATE(created_at) >= ?');
+            params.push(date_from);
+        }
+        if (date_to) {
+            conditions.push('DATE(created_at) <= ?');
+            params.push(date_to);
+        }
+        if (outcome) {
+            conditions.push('outcome = ?');
+            params.push(outcome);
+        }
+        if (business_name) {
+            conditions.push('business_name LIKE ?');
+            params.push(`%${business_name}%`);
+        }
+        if (contact_person) {
+            conditions.push('contact_person LIKE ?');
+            params.push(`%${contact_person}%`);
+        }
+        if (business_id) {
+            conditions.push('business_id = ?');
+            params.push(business_id);
+        }
+
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+        const offset = (page - 1) * limit;
+
+        connection = await pool.getConnection();
+
+        let query = `
+            SELECT * FROM comprehensive_reports
+            ${whereClause}
+        `;
+
+        if (report_type) {
+            if (whereClause) {
+                query += ' AND report_type = ?';
+            } else {
+                query += ' WHERE report_type = ?';
+            }
+            params.push(report_type);
+        }
+
+        query += `
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        `;
+        params.push(parseInt(limit), offset);
+
+        const [reports] = await connection.execute(query, params);
+
+        // Get total count for pagination
+        let countQuery = `
+            SELECT COUNT(*) as total FROM comprehensive_reports
+            ${whereClause}
+        `;
+        let countParams = [...params.slice(0, -2)]; // Remove limit and offset
+
+        if (report_type) {
+            if (whereClause) {
+                countQuery += ' AND report_type = ?';
+            } else {
+                countQuery += ' WHERE report_type = ?';
+            }
+            countParams.push(report_type);
+        }
+
+        const [countResult] = await connection.execute(countQuery, countParams);
+        const total = countResult[0].total;
+
+        res.json({
+            reports,
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / limit)
+            }
+        });
+
+    } catch (error) {
+        console.error('Get reports error:', error);
+        res.status(500).json({ error: 'Failed to fetch reports' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// =============================================================================
+// PHOTO ACCESS ROUTE - For viewing uploaded photos
+// =============================================================================
+
+app.get('/api/reports/photo/:filename', authenticateToken, (req, res) => {
+    try {
+        const { filename } = req.params;
+        const photoPath = path.join(__dirname, 'uploads', filename);
+        
+        // Check if file exists
+        if (!fs.existsSync(photoPath)) {
+            return res.status(404).json({ error: 'Photo not found' });
+        }
+        
+        // Set appropriate headers for image display
+        const ext = path.extname(filename).toLowerCase();
+        const mimeTypes = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp'
+        };
+        
+        const mimeType = mimeTypes[ext] || 'application/octet-stream';
+        res.setHeader('Content-Type', mimeType);
+        res.setHeader('Cache-Control', 'public, max-age=31536000'); // Cache for 1 year
+        
+        res.sendFile(photoPath);
+        
+    } catch (error) {
+        console.error('Photo access error:', error);
+        res.status(500).json({ error: 'Failed to access photo' });
+    }
+});
+
+// =============================================================================
+// ENHANCED DASHBOARD WITH REPORT STATISTICS
+// =============================================================================
+
+app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const userCondition = req.user.role !== 'admin' ? 'WHERE user_id = ?' : '';
+        const userParam = req.user.role !== 'admin' ? [req.user.id] : [];
+
+        connection = await pool.getConnection();
+
+        // Get comprehensive statistics
+        const [coldStats] = await connection.execute(`
+            SELECT 
+                COUNT(*) as total_visits,
+                SUM(CASE WHEN outcome = 'Deal Closed' THEN 1 ELSE 0 END) as deals_closed,
+                SUM(CASE WHEN DATE(created_at) = CURDATE() THEN 1 ELSE 0 END) as today_visits,
+                SUM(CASE WHEN DATE(created_at) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) THEN 1 ELSE 0 END) as week_visits,
+                SUM(CASE WHEN photo_proof IS NOT NULL THEN 1 ELSE 0 END) as with_photos,
+                SUM(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 ELSE 0 END) as with_location
+            FROM cold_calling_reports 
+            ${userCondition}
+        `, userParam);
+
+        const [teleStats] = await connection.execute(`
+            SELECT 
+                COUNT(*) as total_calls,
+                SUM(CASE WHEN outcome = 'Deal Closed' THEN 1 ELSE 0 END) as deals_closed,
+                SUM(CASE WHEN DATE(created_at) = CURDATE() THEN 1 ELSE 0 END) as today_calls,
+                SUM(CASE WHEN DATE(created_at) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) THEN 1 ELSE 0 END) as week_calls
+            FROM telemarketing_reports 
+            ${userCondition}
+        `, userParam);
+        
+        // Query for weekly activity chart
+        const [weeklyActivity] = await connection.execute(`
+            (SELECT 'cold_calling' as type, DATE(created_at) as date, COUNT(*) as count 
+             FROM cold_calling_reports 
+             ${userCondition ? 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND user_id = ?' : 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)'}
+             GROUP BY DATE(created_at))
+            UNION ALL
+            (SELECT 'telemarketing' as type, DATE(created_at) as date, COUNT(*) as count 
+             FROM telemarketing_reports 
+             ${userCondition ? 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND user_id = ?' : 'WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)'}
+             GROUP BY DATE(created_at))
+            ORDER BY date DESC
+        `, [...userParam, ...userParam]);
+
+        // Get goals progress
+        const [goalsProgress] = await connection.execute(`
+            SELECT g.*, 
+                   CASE 
+                       WHEN g.goal_type = 'daily' THEN 
+                           CASE WHEN g.activity_type = 'cold_calling' THEN
+                               (SELECT COUNT(*) FROM cold_calling_reports WHERE user_id = g.user_id AND DATE(created_at) = CURDATE())
+                           WHEN g.activity_type = 'telemarketing' THEN
+                               (SELECT COUNT(*) FROM telemarketing_reports WHERE user_id = g.user_id AND DATE(created_at) = CURDATE())
+                           WHEN g.activity_type = 'deals' THEN
+                               (SELECT COUNT(*) FROM comprehensive_reports WHERE user_id = g.user_id AND outcome = 'Deal Closed' AND DATE(created_at) = CURDATE())
+                           ELSE 0
+                       END
+                       WHEN g.goal_type = 'weekly' THEN
+                           CASE WHEN g.activity_type = 'cold_calling' THEN
+                               (SELECT COUNT(*) FROM cold_calling_reports WHERE user_id = g.user_id AND WEEK(created_at) = WEEK(CURDATE()))
+                           WHEN g.activity_type = 'telemarketing' THEN
+                               (SELECT COUNT(*) FROM telemarketing_reports WHERE user_id = g.user_id AND WEEK(created_at) = WEEK(CURDATE()))
+                           WHEN g.activity_type = 'deals' THEN
+                               (SELECT COUNT(*) FROM comprehensive_reports WHERE user_id = g.user_id AND outcome = 'Deal Closed' AND WEEK(created_at) = WEEK(CURDATE()))
+                           ELSE 0
+                       END
+                   END as current_progress
+            FROM goals g
+            WHERE g.status = 'active' 
+              AND CURDATE() BETWEEN g.start_date AND g.end_date
+              ${req.user.role !== 'admin' ? 'AND g.user_id = ?' : ''}
+        `, req.user.role !== 'admin' ? [req.user.id] : []);
+
+        // Get pending tasks count
+        const [taskStats] = await connection.execute(`
+            SELECT 
+                COUNT(*) as total_tasks,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_tasks,
+                SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_tasks,
+                SUM(CASE WHEN DATE(due_date) = CURDATE() THEN 1 ELSE 0 END) as due_today
+            FROM tasks 
+            WHERE assigned_to = ? OR assigned_by = ?
+        `, [req.user.id, req.user.id]);
+
+        // Get follow-ups count
+        const [followUpStats] = await connection.execute(`
+            SELECT 
+                COUNT(*) as total_followups,
+                SUM(CASE WHEN status = 'scheduled' THEN 1 ELSE 0 END) as scheduled_followups,
+                SUM(CASE WHEN DATE(scheduled_date) = CURDATE() THEN 1 ELSE 0 END) as due_today
+            FROM follow_ups 
+            WHERE user_id = ?
+        `, [req.user.id]);
+
+        res.json({
+            coldCalling: coldStats[0] || { total_visits: 0, deals_closed: 0, today_visits: 0, week_visits: 0, with_photos: 0, with_location: 0 },
+            telemarketing: teleStats[0] || { total_calls: 0, deals_closed: 0, today_calls: 0, week_calls: 0 },
+            goals: goalsProgress,
+            tasks: taskStats[0] || { total_tasks: 0, pending_tasks: 0, in_progress_tasks: 0, due_today: 0 },
+            followUps: followUpStats[0] || { total_followups: 0, scheduled_followups: 0, due_today: 0 },
+            weeklyActivity: weeklyActivity
+        });
+
+    } catch (error) {
+        console.error('Dashboard stats error:', error);
+        res.status(500).json({ error: 'Failed to fetch dashboard statistics' });
     } finally {
         if (connection) connection.release();
     }
