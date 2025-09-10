@@ -269,6 +269,10 @@ app.get('/api/users', authenticateToken, requireAdmin, requireDB, async (req, re
     }
 });
 
+// =============================================================================
+// FIXED USER CREATION ROUTE - Replace existing one
+// =============================================================================
+
 app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, res) => {
     let connection;
     try {
@@ -305,7 +309,15 @@ app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, r
         const [result] = await connection.execute(`
             INSERT INTO users (name, email, \`password\`, role, executive_type, department, phone, hire_date, status) 
             VALUES (?, ?, ?, ?, ?, ?, ?, CURDATE(), "active")
-        `, [name, email, hashedPassword, role, executive_type || null, department || 'Sales', phone || null]);
+        `, [
+            name, 
+            email, 
+            hashedPassword, 
+            role, 
+            executive_type || null,  // Handle undefined properly
+            department || 'Sales',   // Provide default
+            phone || null           // Handle undefined properly
+        ]);
 
         res.json({ 
             id: result.insertId, 
@@ -448,6 +460,10 @@ app.get('/api/businesses', authenticateToken, requireDB, async (req, res) => {
     }
 });
 
+// =============================================================================
+// FIXED BUSINESS CREATION ROUTE - Replace existing one
+// =============================================================================
+
 app.post('/api/businesses', authenticateToken, requireDB, async (req, res) => {
     let connection;
     try {
@@ -461,6 +477,8 @@ app.post('/api/businesses', authenticateToken, requireDB, async (req, res) => {
         }
 
         connection = await pool.getConnection();
+        
+        // Handle undefined/null values properly
         const [result] = await connection.execute(`
             INSERT INTO businesses 
             (business_name, contact_person, contact_position, phone, email, address, 
@@ -468,9 +486,21 @@ app.post('/api/businesses', authenticateToken, requireDB, async (req, res) => {
              created_by, notes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
-            business_name, contact_person, contact_position, phone, email, address,
-            city, state, postal_code, industry, business_size, priority, 
-            assigned_to, req.user.id, notes
+            business_name,
+            contact_person || null,
+            contact_position || null,
+            phone || null,
+            email || null,
+            address || null,
+            city || null,
+            state || null,
+            postal_code || null,
+            industry || null,
+            business_size || 'Small',
+            priority || 'Medium',
+            assigned_to || null,  // This was causing the undefined error
+            req.user.id,
+            notes || null
         ]);
 
         res.json({ 
@@ -955,6 +985,18 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
         // Start transaction
         await connection.execute('START TRANSACTION');
 
+        // Handle business_id validation - if provided, check if it exists
+        let validBusinessId = null;
+        if (business_id && business_id !== '' && business_id !== 'null') {
+            const [businessCheck] = await connection.execute(
+                'SELECT id FROM businesses WHERE id = ?', 
+                [business_id]
+            );
+            if (businessCheck.length > 0) {
+                validBusinessId = business_id;
+            }
+        }
+
         const [result] = await connection.execute(`
             INSERT INTO cold_calling_reports 
             (user_id, business_name, contact_person, contact_position, visit_time, 
@@ -962,35 +1004,45 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
              follow_up_required, follow_up_date, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
         `, [
-            req.user.id, business_name, contact_person, contact_position, visitDateTime, 
-            photo_path, outcome, notes, latitude, longitude, business_id,
-            follow_up_required === 'true', follow_up_date
+            req.user.id, 
+            business_name, 
+            contact_person, 
+            contact_position, 
+            visitDateTime, 
+            photo_path, 
+            outcome, 
+            notes || null, 
+            latitude || null, 
+            longitude || null, 
+            validBusinessId,  // This fixes the foreign key constraint error
+            follow_up_required === 'true', 
+            follow_up_date || null
         ]);
 
-        // Add to business interactions
-        if (business_id) {
+        // Add to business interactions only if we have a valid business_id
+        if (validBusinessId) {
             await connection.execute(`
                 INSERT INTO business_interactions 
                 (business_id, user_id, interaction_type, outcome, notes, interaction_date)
                 VALUES (?, ?, 'cold_call', ?, ?, ?)
-            `, [business_id, req.user.id, outcome, notes, visitDateTime]);
+            `, [validBusinessId, req.user.id, outcome, notes || null, visitDateTime]);
 
             // Update business status if deal closed
             if (outcome === 'Deal Closed') {
                 await connection.execute(
                     'UPDATE businesses SET status = "Deal Closed" WHERE id = ?',
-                    [business_id]
+                    [validBusinessId]
                 );
             }
         }
 
-        // Create follow-up if required
-        if (follow_up_required === 'true' && follow_up_date) {
+        // Create follow-up if required and we have a valid business_id
+        if (follow_up_required === 'true' && follow_up_date && validBusinessId) {
             await connection.execute(`
                 INSERT INTO follow_ups 
                 (business_id, user_id, report_id, report_type, follow_up_type, scheduled_date, notes)
                 VALUES (?, ?, ?, 'cold_calling', 'call', ?, 'Follow-up from cold calling visit')
-            `, [business_id, req.user.id, result.insertId, follow_up_date]);
+            `, [validBusinessId, req.user.id, result.insertId, follow_up_date]);
         }
 
         // Update goals progress
@@ -1012,6 +1064,11 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
     }
 });
 
+
+// =============================================================================
+// FIXED TELEMARKETING REPORT ROUTE - Replace existing one
+// =============================================================================
+
 app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req, res) => {
     let connection;
     try {
@@ -1032,40 +1089,60 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
         // Start transaction
         await connection.execute('START TRANSACTION');
 
+        // Handle business_id validation - if provided, check if it exists
+        let validBusinessId = null;
+        if (business_id && business_id !== '' && business_id !== 'null') {
+            const [businessCheck] = await connection.execute(
+                'SELECT id FROM businesses WHERE id = ?', 
+                [business_id]
+            );
+            if (businessCheck.length > 0) {
+                validBusinessId = business_id;
+            }
+        }
+
         const [result] = await connection.execute(`
             INSERT INTO telemarketing_reports 
             (user_id, business_name, contact_person, contact_position, call_time, 
              outcome, notes, business_id, follow_up_required, follow_up_date, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
         `, [
-            req.user.id, business_name, contact_person, contact_position, callDateTime, 
-            outcome, notes, business_id, follow_up_required === 'true', follow_up_date
+            req.user.id, 
+            business_name, 
+            contact_person, 
+            contact_position, 
+            callDateTime, 
+            outcome, 
+            notes || null, 
+            validBusinessId,  // This fixes the foreign key constraint error
+            follow_up_required === 'true', 
+            follow_up_date || null
         ]);
 
-        // Add to business interactions
-        if (business_id) {
+        // Add to business interactions only if we have a valid business_id
+        if (validBusinessId) {
             await connection.execute(`
                 INSERT INTO business_interactions 
                 (business_id, user_id, interaction_type, outcome, notes, interaction_date)
                 VALUES (?, ?, 'telemarketing', ?, ?, ?)
-            `, [business_id, req.user.id, outcome, notes, callDateTime]);
+            `, [validBusinessId, req.user.id, outcome, notes || null, callDateTime]);
 
             // Update business status if deal closed
             if (outcome === 'Deal Closed') {
                 await connection.execute(
                     'UPDATE businesses SET status = "Deal Closed" WHERE id = ?',
-                    [business_id]
+                    [validBusinessId]
                 );
             }
         }
 
-        // Create follow-up if required
-        if (follow_up_required === 'true' && follow_up_date) {
+        // Create follow-up if required and we have a valid business_id
+        if (follow_up_required === 'true' && follow_up_date && validBusinessId) {
             await connection.execute(`
                 INSERT INTO follow_ups 
                 (business_id, user_id, report_id, report_type, follow_up_type, scheduled_date, notes)
                 VALUES (?, ?, ?, 'telemarketing', 'call', ?, 'Follow-up from telemarketing call')
-            `, [business_id, req.user.id, result.insertId, follow_up_date]);
+            `, [validBusinessId, req.user.id, result.insertId, follow_up_date]);
         }
 
         // Update goals progress
