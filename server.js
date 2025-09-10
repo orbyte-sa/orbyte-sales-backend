@@ -11,6 +11,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+
 // Middleware
 app.use(cors({
     origin: [
@@ -246,6 +247,27 @@ app.post('/api/auth/login', requireDB, async (req, res) => {
     }
 });
 
+// Helper function to find or create a business and return its ID
+async function getOrCreateBusiness(pool, businessData) {
+    const { business_name, contact_person, contact_position, contact_phone, contact_email, created_by } = businessData;
+    
+    // Check if business already exists
+    const [existing] = await pool.query('SELECT id FROM businesses WHERE business_name = ?', [business_name]);
+    
+    if (existing.length > 0) {
+        return existing[0].id; // Return existing business ID
+    } else {
+        // Business does not exist, create it
+        const sql = `
+            INSERT INTO businesses 
+            (business_name, contact_person, contact_position, phone, email, created_by, status) 
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `;
+        const values = [business_name, contact_person, contact_position, contact_phone, contact_email, created_by, 'Contacted'];
+        const [result] = await pool.query(sql, values);
+        return result.insertId; // Return new business ID
+    }
+}
 // =============================================================================
 // USER MANAGEMENT ROUTES - FIXED
 // =============================================================================
@@ -1349,100 +1371,89 @@ app.put('/api/notifications/:id/read', authenticateToken, requireDB, async (req,
 // ENHANCED REPORT ROUTES - FIXED
 // =============================================================================
 
-// POST a new cold calling report
+// POST a new cold calling report (UPDATED with auto-business creation)
 app.post('/api/reports/cold-calling', [authenticateToken, upload.single('photo_proof')], async (req, res) => {
     try {
-        const {
-            business_name,
-            business_id,
-            contact_person,
-            contact_position,
-            contact_phone,
-            contact_email,
-            visit_time,
-            outcome,
-            notes,
-            latitude,
-            longitude,
-            follow_up_required,
-            follow_up_date
-        } = req.body;
-
+        let { business_id, ...reportData } = req.body;
         const userId = req.user.id;
-        const photo_proof = req.file ? req.file.filename : null;
+        
+        // If no business_id is linked, find or create the business
+        if (!business_id || business_id === 'null' || business_id === '') {
+            business_id = await getOrCreateBusiness(pool, { ...reportData, created_by: userId });
+        }
 
-        // This SQL query has the correct number of columns and value placeholders (15 and 15)
+        const photo_proof = req.file ? req.file.filename : null;
         const sql = `
             INSERT INTO cold_calling_reports 
             (user_id, business_name, business_id, contact_person, contact_position, contact_phone, contact_email, visit_time, outcome, notes, latitude, longitude, photo_proof, follow_up_required, follow_up_date) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
-        
-        // This array provides the correct number of values
         const values = [
-            userId, business_name, business_id || null, contact_person, contact_position, 
-            contact_phone, contact_email,
-            visit_time, outcome, notes, latitude || null, longitude || null, photo_proof, 
-            follow_up_required === 'true', follow_up_date || null
+            userId, reportData.business_name, business_id, reportData.contact_person, reportData.contact_position, 
+            reportData.contact_phone, reportData.contact_email, reportData.visit_time, reportData.outcome, 
+            reportData.notes, reportData.latitude || null, reportData.longitude || null, photo_proof, 
+            reportData.follow_up_required === 'true', reportData.follow_up_date || null
         ];
 
         await pool.query(sql, values);
         res.status(201).json({ message: 'Cold calling report created successfully' });
-
     } catch (error) {
         console.error('Error creating cold calling report:', error);
         res.status(500).json({ error: 'Failed to create report' });
     }
 });
 
-// =============================================================================
-// FIXED TELEMARKETING REPORT ROUTE - Replace existing one
-// =============================================================================
-
-// POST a new telemarketing report
-// After
+// POST a new telemarketing report (UPDATED with auto-business creation)
 app.post('/api/reports/telemarketing', [authenticateToken, upload.none()], async (req, res) => {
     try {
-        const {
-            business_name,
-            business_id,
-            contact_person,
-            contact_position,
-            contact_phone,         // <-- ADD THIS
-            contact_email,         // <-- ADD THIS
-            call_time,
-            outcome,
-            notes,
-            follow_up_required,
-            follow_up_date
-        } = req.body;
-        
+        let { business_id, ...reportData } = req.body;
         const userId = req.user.id;
 
-        // SQL query is modified to include the new columns
+        // If no business_id is linked, find or create the business
+        if (!business_id || business_id === 'null' || business_id === '') {
+            business_id = await getOrCreateBusiness(pool, { ...reportData, created_by: userId });
+        }
+
         const sql = `
             INSERT INTO telemarketing_reports 
             (user_id, business_name, business_id, contact_person, contact_position, contact_phone, contact_email, call_time, outcome, notes, follow_up_required, follow_up_date) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `;
-        
-        // Values array is modified to include the new data
         const values = [
-            userId, business_name, business_id || null, contact_person, contact_position, 
-            contact_phone, contact_email, // <-- ADD THESE
-            call_time, outcome, notes, 
-            follow_up_required === 'true', follow_up_date || null
+            userId, reportData.business_name, business_id, reportData.contact_person, reportData.contact_position, 
+            reportData.contact_phone, reportData.contact_email, reportData.call_time, reportData.outcome, 
+            reportData.notes, reportData.follow_up_required === 'true', reportData.follow_up_date || null
         ];
 
         await pool.query(sql, values);
         res.status(201).json({ message: 'Telemarketing report created successfully' });
-
     } catch (error) {
         console.error('Error creating telemarketing report:', error);
         res.status(500).json({ error: 'Failed to create report' });
     }
 });
 
+// DELETE a business
+app.delete('/api/businesses/:id', authenticateToken, async (req, res) => {
+    // Security check: Only admins can delete businesses
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden: You do not have permission to perform this action.' });
+    }
+
+    try {
+        const { id } = req.params;
+        const [result] = await pool.query('DELETE FROM businesses WHERE id = ?', [id]);
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Business not found' });
+        }
+        
+        res.status(200).json({ message: 'Business deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting business:', error);
+        res.status(500).json({ error: 'Failed to delete business' });
+    }
+});
 // Enhanced Get reports with advanced filtering
 app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
     let connection;
