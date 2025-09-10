@@ -1353,7 +1353,7 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
     let connection;
     try {
         const {
-            business_name, contact_person, contact_position, visit_time, outcome, notes,
+            business_name, contact_person, contact_position, contact_phone, contact_email, visit_time, outcome, notes,
             latitude, longitude, business_id, follow_up_required, follow_up_date
         } = req.body;
 
@@ -1384,7 +1384,7 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
 
         const [result] = await connection.execute(`
             INSERT INTO cold_calling_reports 
-            (user_id, business_name, contact_person, contact_position, visit_time, 
+            (user_id, business_name, contact_person, contact_position, contact_phone, contact_email, visit_time, 
              photo_proof, outcome, notes, latitude, longitude, business_id, 
              follow_up_required, follow_up_date, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
@@ -1393,6 +1393,8 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
             business_name, 
             contact_person, 
             contact_position, 
+            contact_phone, 
+            contact_email,
             visitDateTime, 
             photo_path, 
             outcome, 
@@ -1458,7 +1460,7 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
     let connection;
     try {
         const {
-            business_name, contact_person, contact_position, call_time, outcome, notes,
+            business_name, contact_person, contact_position, contact_phone, contact_email, call_time, outcome, notes,
             business_id, follow_up_required, follow_up_date
         } = req.body;
 
@@ -1488,14 +1490,16 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
 
         const [result] = await connection.execute(`
             INSERT INTO telemarketing_reports 
-            (user_id, business_name, contact_person, contact_position, call_time, 
+            (user_id, business_name, contact_person, contact_position, contact_phone, contact_email, call_time, 
              outcome, notes, business_id, follow_up_required, follow_up_date, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
         `, [
             req.user.id, 
             business_name, 
             contact_person, 
-            contact_position, 
+            contact_position,
+            contact_phone, 
+            contact_email,
             callDateTime, 
             outcome, 
             notes || null, 
