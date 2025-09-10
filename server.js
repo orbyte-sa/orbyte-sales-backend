@@ -1400,7 +1400,8 @@ app.post('/api/reports/cold-calling', [authenticateToken, upload.single('photo_p
 // =============================================================================
 
 // POST a new telemarketing report
-app.post('/api/reports/telemarketing', authenticateToken, async (req, res) => {
+// After
+app.post('/api/reports/telemarketing', [authenticateToken, upload.none()], async (req, res) => {
     try {
         const {
             business_name,
