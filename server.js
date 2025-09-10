@@ -482,6 +482,80 @@ app.get('/api/calendar/events', authenticateToken, async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch calendar events' });
     }
 });
+// DELETE multiple reports
+app.delete('/api/reports/bulk-delete', authenticateToken, async (req, res) => {
+    // Security Check: Only admins can perform bulk delete
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const { reports } = req.body; // Expecting an array of { id, type }
+    if (!reports || !Array.isArray(reports) || reports.length === 0) {
+        return res.status(400).json({ error: 'Invalid request body' });
+    }
+
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+
+        for (const report of reports) {
+            if (report.type === 'cold_calling') {
+                await connection.query('DELETE FROM cold_calling_reports WHERE id = ?', [report.id]);
+            } else if (report.type === 'telemarketing') {
+                await connection.query('DELETE FROM telemarketing_reports WHERE id = ?', [report.id]);
+            }
+        }
+
+        await connection.commit();
+        res.status(200).json({ message: 'Reports deleted successfully' });
+    } catch (error) {
+        await connection.rollback();
+        console.error('Error during bulk report delete:', error);
+        res.status(500).json({ error: 'Failed to delete reports' });
+    } finally {
+        connection.release();
+    }
+});
+
+// PUT (update) bulk assign tasks
+app.put('/api/tasks/bulk-assign', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { taskIds, assignedTo } = req.body;
+    if (!taskIds || !Array.isArray(taskIds) || !assignedTo) {
+        return res.status(400).json({ error: 'Invalid request: taskIds and assignedTo are required.' });
+    }
+
+    try {
+        const sql = 'UPDATE tasks SET assigned_to = ? WHERE id IN (?)';
+        await pool.query(sql, [assignedTo, taskIds]);
+        res.status(200).json({ message: 'Tasks reassigned successfully.' });
+    } catch (error) {
+        console.error('Error bulk assigning tasks:', error);
+        res.status(500).json({ error: 'Failed to reassign tasks.' });
+    }
+});
+
+// DELETE bulk delete tasks
+app.delete('/api/tasks/bulk-delete', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { taskIds } = req.body;
+    if (!taskIds || !Array.isArray(taskIds)) {
+        return res.status(400).json({ error: 'Invalid request: taskIds array is required.' });
+    }
+
+    try {
+        const sql = 'DELETE FROM tasks WHERE id IN (?)';
+        await pool.query(sql, [taskIds]);
+        res.status(200).json({ message: 'Tasks deleted successfully.' });
+    } catch (error) {
+        console.error('Error bulk deleting tasks:', error);
+        res.status(500).json({ error: 'Failed to delete tasks.' });
+    }
+});
 
 // =============================================================================
 // BUSINESS MANAGEMENT ROUTES
