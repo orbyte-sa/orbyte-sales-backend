@@ -857,6 +857,8 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
             return res.status(400).json({ error: 'All required fields must be filled' });
         }
 
+        // Convert datetime-local to MySQL datetime format
+        const visitDateTime = new Date(visit_time).toISOString().slice(0, 19).replace('T', ' ');
         const photo_path = req.file ? req.file.filename : null;
 
         connection = await pool.getConnection();
@@ -871,7 +873,7 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
              follow_up_required, follow_up_date, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
         `, [
-            req.user.id, business_name, contact_person, contact_position, visit_time, 
+            req.user.id, business_name, contact_person, contact_position, visitDateTime, 
             photo_path, outcome, notes, latitude, longitude, business_id,
             follow_up_required === 'true', follow_up_date
         ]);
@@ -882,7 +884,7 @@ app.post('/api/reports/cold-calling', authenticateToken, requireDB, upload.singl
                 INSERT INTO business_interactions 
                 (business_id, user_id, interaction_type, outcome, notes, interaction_date)
                 VALUES (?, ?, 'cold_call', ?, ?, ?)
-            `, [business_id, req.user.id, outcome, notes, visit_time]);
+            `, [business_id, req.user.id, outcome, notes, visitDateTime]);
 
             // Update business status if deal closed
             if (outcome === 'Deal Closed') {
@@ -933,6 +935,9 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
             return res.status(400).json({ error: 'All required fields must be filled' });
         }
 
+        // Convert datetime-local to MySQL datetime format
+        const callDateTime = new Date(call_time).toISOString().slice(0, 19).replace('T', ' ');
+
         connection = await pool.getConnection();
         
         // Start transaction
@@ -944,7 +949,7 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
              outcome, notes, business_id, follow_up_required, follow_up_date, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
         `, [
-            req.user.id, business_name, contact_person, contact_position, call_time, 
+            req.user.id, business_name, contact_person, contact_position, callDateTime, 
             outcome, notes, business_id, follow_up_required === 'true', follow_up_date
         ]);
 
@@ -954,7 +959,7 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
                 INSERT INTO business_interactions 
                 (business_id, user_id, interaction_type, outcome, notes, interaction_date)
                 VALUES (?, ?, 'telemarketing', ?, ?, ?)
-            `, [business_id, req.user.id, outcome, notes, call_time]);
+            `, [business_id, req.user.id, outcome, notes, callDateTime]);
 
             // Update business status if deal closed
             if (outcome === 'Deal Closed') {
@@ -993,111 +998,56 @@ app.post('/api/reports/telemarketing', authenticateToken, requireDB, async (req,
     }
 });
 
-// Enhanced Get reports with advanced filtering
-app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
+// =============================================================================
+// FIXED USER MANAGEMENT - Update role handling
+// =============================================================================
+
+app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, res) => {
     let connection;
     try {
-        const { 
-            date_from, date_to, outcome, business_name, contact_person, 
-            report_type, user_id, business_id, page = 1, limit = 50
-        } = req.query;
-        
-        let conditions = [];
-        let params = [];
+        const { name, email, password, role, executive_type, department, phone } = req.body;
 
-        // If not admin, only show user's own reports
-        if (req.user.role !== 'admin') {
-            conditions.push('user_id = ?');
-            params.push(req.user.id);
-        } else if (user_id) {
-            conditions.push('user_id = ?');
-            params.push(user_id);
+        if (!name || !email || !password || !role) {
+            return res.status(400).json({ error: 'Name, email, password, and role are required' });
         }
 
-        if (date_from) {
-            conditions.push('DATE(created_at) >= ?');
-            params.push(date_from);
-        }
-        if (date_to) {
-            conditions.push('DATE(created_at) <= ?');
-            params.push(date_to);
-        }
-        if (outcome) {
-            conditions.push('outcome = ?');
-            params.push(outcome);
-        }
-        if (business_name) {
-            conditions.push('business_name LIKE ?');
-            params.push(`%${business_name}%`);
-        }
-        if (contact_person) {
-            conditions.push('contact_person LIKE ?');
-            params.push(`%${contact_person}%`);
-        }
-        if (business_id) {
-            conditions.push('business_id = ?');
-            params.push(business_id);
+        // Validate role
+        if (!['admin', 'user'].includes(role)) {
+            return res.status(400).json({ error: 'Invalid role. Must be admin or user.' });
         }
 
-        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-        const offset = (page - 1) * limit;
+        // Validate executive_type if provided
+        if (executive_type && !['indoor', 'outdoor'].includes(executive_type)) {
+            return res.status(400).json({ error: 'Invalid executive type. Must be indoor or outdoor.' });
+        }
 
         connection = await pool.getConnection();
 
-        let query = `
-            SELECT * FROM comprehensive_reports
-            ${whereClause}
-        `;
+        // Check if user already exists
+        const [existingUsers] = await connection.execute(
+            'SELECT id FROM users WHERE email = ?',
+            [email]
+        );
 
-        if (report_type) {
-            if (whereClause) {
-                query += ' AND report_type = ?';
-            } else {
-                query += ' WHERE report_type = ?';
-            }
-            params.push(report_type);
+        if (existingUsers.length > 0) {
+            return res.status(400).json({ error: 'User with this email already exists' });
         }
 
-        query += `
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-        `;
-        params.push(parseInt(limit), offset);
+        const hashedPassword = await bcrypt.hash(password, 10);
 
-        const [reports] = await connection.execute(query, params);
+        const [result] = await connection.execute(`
+            INSERT INTO users (name, email, \`password\`, role, executive_type, department, phone, hire_date, status) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURDATE(), "active")
+        `, [name, email, hashedPassword, role, executive_type || null, department || 'Sales', phone || null]);
 
-        // Get total count for pagination
-        let countQuery = `
-            SELECT COUNT(*) as total FROM comprehensive_reports
-            ${whereClause}
-        `;
-        let countParams = [...params.slice(0, -2)]; // Remove limit and offset
-
-        if (report_type) {
-            if (whereClause) {
-                countQuery += ' AND report_type = ?';
-            } else {
-                countQuery += ' WHERE report_type = ?';
-            }
-            countParams.push(report_type);
-        }
-
-        const [countResult] = await connection.execute(countQuery, countParams);
-        const total = countResult[0].total;
-
-        res.json({
-            reports,
-            pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
-                total,
-                pages: Math.ceil(total / limit)
-            }
+        res.json({ 
+            id: result.insertId, 
+            message: 'User created successfully' 
         });
 
     } catch (error) {
-        console.error('Get reports error:', error);
-        res.status(500).json({ error: 'Failed to fetch reports' });
+        console.error('Create user error:', error);
+        res.status(500).json({ error: 'Failed to create user' });
     } finally {
         if (connection) connection.release();
     }
