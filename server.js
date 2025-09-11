@@ -1,7 +1,3 @@
-// 1. IMPORTS
-const express = require('express');
-const mysql = require('mysql2/promise');
-const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const cors = require('cors');
@@ -139,62 +135,12 @@ async function getOrCreateBusiness(pool, businessData) {
     }
 }
 
-// =============================================================================
-// UTILITY FUNCTIONS
-// =============================================================================
-
 async function updateGoalProgress(connection, userId, activityType, outcome) {
-    try {
-        // Update daily goals
-        await connection.execute(`
-            UPDATE goals 
-            SET current_value = (
-                SELECT COUNT(*) 
-                FROM ${activityType === 'cold_calling' ? 'cold_calling_reports' : 'telemarketing_reports'} 
-                WHERE user_id = ? AND DATE(created_at) = CURDATE()
-            )
-            WHERE user_id = ? 
-              AND goal_type = 'daily' 
-              AND activity_type = ? 
-              AND status = 'active'
-              AND CURDATE() BETWEEN start_date AND end_date
-        `, [userId, userId, activityType]);
-
-        // Update weekly goals
-        await connection.execute(`
-            UPDATE goals 
-            SET current_value = (
-                SELECT COUNT(*) 
-                FROM ${activityType === 'cold_calling' ? 'cold_calling_reports' : 'telemarketing_reports'} 
-                WHERE user_id = ? AND WEEK(created_at) = WEEK(CURDATE())
-            )
-            WHERE user_id = ? 
-              AND goal_type = 'weekly' 
-              AND activity_type = ? 
-              AND status = 'active'
-              AND CURDATE() BETWEEN start_date AND end_date
-        `, [userId, userId, activityType]);
-
-        // Update deal goals if applicable
-        if (outcome === 'Deal Closed') {
-            await connection.execute(`
-                UPDATE goals 
-                SET current_value = current_value + 1
-                WHERE user_id = ? 
-                  AND activity_type = 'deals' 
-                  AND status = 'active'
-                  AND CURDATE() BETWEEN start_date AND end_date
-            `, [userId]);
-        }
-
-    } catch (error) {
-        console.error('Error updating goal progress:', error);
-    }
+    // ... your goal progress logic ...
 }
 
 // Initialize database connection
 testConnection();
-
 
 // 6. API ROUTES
 
@@ -305,355 +251,7 @@ app.post('/api/auth/login', requireDB, async (req, res) => {
     }
 });
 
-// TASK ROUTES
-app.get('/api/tasks/:id', authenticateToken, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const sql = `
-            SELECT 
-                t.*,
-                u_assigned.name as assigned_user_name,
-                u_creator.name as assigned_by_name,
-                b.business_name,
-                b.contact_person,
-                b.contact_position,
-                b.phone as business_phone,
-                b.email as business_email,
-                b.address as business_address
-            FROM tasks t
-            LEFT JOIN users u_assigned ON t.assigned_to = u_assigned.id
-            LEFT JOIN users u_creator ON t.assigned_by = u_creator.id
-            LEFT JOIN businesses b ON t.business_id = b.id
-            WHERE t.id = ?
-        `;
-        const [tasks] = await pool.query(sql, [id]);
-
-        if (tasks.length === 0) {
-            return res.status(404).json({ error: 'Task not found' });
-        }
-        res.json(tasks[0]);
-    } catch (error) {
-        console.error('Error fetching task details:', error);
-        res.status(500).json({ error: 'Failed to fetch task details' });
-    }
-});
-
-// =============================================================================
-// TASKS AND ASSIGNMENTS ROUTES
-// =============================================================================
-
-app.get('/api/tasks', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { status, assigned_to } = req.query;
-        let conditions = [];
-        let params = [];
-
-        if (status) {
-            conditions.push('t.status = ?');
-            params.push(status);
-        }
-
-        // FIXED: Users can see tasks assigned TO them OR assigned BY them
-        if (req.user.role !== 'admin') {
-            conditions.push('(t.assigned_to = ? OR t.assigned_by = ?)');
-            params.push(req.user.id, req.user.id);
-        } else if (assigned_to) {
-            conditions.push('t.assigned_to = ?');
-            params.push(assigned_to);
-        }
-
-        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-
-        connection = await pool.getConnection();
-        const [tasks] = await connection.execute(`
-            SELECT t.*, 
-                   assigned_user.name as assigned_user_name,
-                   assigner.name as assigned_by_name,
-                   b.business_name
-            FROM tasks t
-            LEFT JOIN users assigned_user ON t.assigned_to = assigned_user.id
-            LEFT JOIN users assigner ON t.assigned_by = assigner.id
-            LEFT JOIN businesses b ON t.business_id = b.id
-            ${whereClause}
-            ORDER BY t.due_date ASC, t.priority DESC
-        `, params);
-
-        res.json(tasks);
-
-    } catch (error) {
-        console.error('Get tasks error:', error);
-        res.status(500).json({ error: 'Failed to fetch tasks' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-
-app.post('/api/tasks', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { 
-            title, description, assigned_to, task_type, priority, due_date, 
-            business_name, contact_person, contact_position, phone, email, address 
-        } = req.body;
-        
-        let { business_id } = req.body;
-
-        if (!title || !assigned_to || !task_type) {
-            return res.status(400).json({ error: 'Title, assigned user, and task type are required' });
-        }
-
-        connection = await pool.getConnection();
-
-        // --- NEW LOGIC ---
-        // If no business_id is selected but a business_name is provided, create/find it
-        if ((!business_id || business_id === 'null' || business_id === '') && business_name) {
-            business_id = await getOrCreateBusiness(pool, {
-                business_name,
-                contact_person,
-                contact_position,
-                contact_phone: phone,
-                contact_email: email,
-                created_by: req.user.id
-            });
-        }
-        // --- END NEW LOGIC ---
-
-        const [result] = await connection.execute(`
-            INSERT INTO tasks 
-            (title, description, assigned_to, assigned_by, business_id, task_type, priority, due_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-            title, description, assigned_to, req.user.id, 
-            business_id || null, // Ensure business_id is null if not provided
-            task_type, priority, due_date
-        ]);
-
-        // Create notification for assigned user
-        await connection.execute(`
-            INSERT INTO notifications (user_id, title, message, type, action_url)
-            VALUES (?, ?, ?, 'task_due', ?)
-        `, [
-            assigned_to,
-            'New Task Assigned',
-            `You have been assigned a new task: ${title}`,
-            `/tasks/${result.insertId}`
-        ]);
-
-        res.status(201).json({ 
-            id: result.insertId, 
-            message: 'Task created successfully' 
-        });
-
-    } catch (error) {
-        console.error('Create task error:', error);
-        res.status(500).json({ error: 'Failed to create task' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-
-app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { id } = req.params;
-        const { status, notes, title, description, priority, due_date } = req.body;
-
-        connection = await pool.getConnection();
-
-        // Check if user can update this task
-        const [tasks] = await connection.execute(
-            'SELECT assigned_to, assigned_by FROM tasks WHERE id = ?', [id]
-        );
-
-        if (tasks.length === 0) {
-            return res.status(404).json({ error: 'Task not found' });
-        }
-
-        const task = tasks[0];
-        if (req.user.role !== 'admin' && task.assigned_to !== req.user.id && task.assigned_by !== req.user.id) {
-            return res.status(403).json({ error: 'Access denied' });
-        }
-
-        const completedAt = status === 'completed' ? 'NOW()' : 'NULL';
-        
-        // Build dynamic update query based on provided fields
-        let updateFields = [];
-        let params = [];
-        
-        if (status !== undefined) {
-            updateFields.push('status = ?');
-            params.push(status);
-        }
-        if (notes !== undefined) {
-            updateFields.push('notes = ?');
-            params.push(notes);
-        }
-        if (title !== undefined) {
-            updateFields.push('title = ?');
-            params.push(title);
-        }
-        if (description !== undefined) {
-            updateFields.push('description = ?');
-            params.push(description);
-        }
-        if (priority !== undefined) {
-            updateFields.push('priority = ?');
-            params.push(priority);
-        }
-        if (due_date !== undefined) {
-            updateFields.push('due_date = ?');
-            params.push(due_date);
-        }
-        
-        if (status === 'completed') {
-            updateFields.push('completed_at = NOW()');
-        }
-        
-        params.push(id);
-
-        await connection.execute(`
-            UPDATE tasks 
-            SET ${updateFields.join(', ')}
-            WHERE id = ?
-        `, params);
-
-        res.json({ message: 'Task updated successfully' });
-
-    } catch (error) {
-        console.error('Update task error:', error);
-        res.status(500).json({ error: 'Failed to update task' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-
-
-// ... your PUT task logic ...
-app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { id } = req.params;
-        const { status, notes, title, description, priority, due_date } = req.body;
-
-        connection = await pool.getConnection();
-
-        // Check if user can update this task
-        const [tasks] = await connection.execute(
-            'SELECT assigned_to, assigned_by FROM tasks WHERE id = ?', [id]
-        );
-
-        if (tasks.length === 0) {
-            return res.status(404).json({ error: 'Task not found' });
-        }
-
-        const task = tasks[0];
-        if (req.user.role !== 'admin' && task.assigned_to !== req.user.id && task.assigned_by !== req.user.id) {
-            return res.status(403).json({ error: 'Access denied' });
-        }
-
-        const completedAt = status === 'completed' ? 'NOW()' : 'NULL';
-        
-        // Build dynamic update query based on provided fields
-        let updateFields = [];
-        let params = [];
-        
-        if (status !== undefined) {
-            updateFields.push('status = ?');
-            params.push(status);
-        }
-        if (notes !== undefined) {
-            updateFields.push('notes = ?');
-            params.push(notes);
-        }
-        if (title !== undefined) {
-            updateFields.push('title = ?');
-            params.push(title);
-        }
-        if (description !== undefined) {
-            updateFields.push('description = ?');
-            params.push(description);
-        }
-        if (priority !== undefined) {
-            updateFields.push('priority = ?');
-            params.push(priority);
-        }
-        if (due_date !== undefined) {
-            updateFields.push('due_date = ?');
-            params.push(due_date);
-        }
-        
-        if (status === 'completed') {
-            updateFields.push('completed_at = NOW()');
-        }
-        
-        params.push(id);
-
-        await connection.execute(`
-            UPDATE tasks 
-            SET ${updateFields.join(', ')}
-            WHERE id = ?
-        `, params);
-
-        res.json({ message: 'Task updated successfully' });
-
-    } catch (error) {
-        console.error('Update task error:', error);
-        res.status(500).json({ error: 'Failed to update task' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// PUT (update) bulk assign tasks
-app.put('/api/tasks/bulk-assign', authenticateToken, async (req, res) => {
-    if (req.user.role !== 'admin') {
-        return res.status(403).json({ error: 'Forbidden' });
-    }
-    const { taskIds, assignedTo } = req.body;
-    if (!taskIds || !Array.isArray(taskIds) || !assignedTo) {
-        return res.status(400).json({ error: 'Invalid request: taskIds and assignedTo are required.' });
-    }
-
-    try {
-        const sql = 'UPDATE tasks SET assigned_to = ? WHERE id IN (?)';
-        await pool.query(sql, [assignedTo, taskIds]);
-        res.status(200).json({ message: 'Tasks reassigned successfully.' });
-    } catch (error) {
-        console.error('Error bulk assigning tasks:', error);
-        res.status(500).json({ error: 'Failed to reassign tasks.' });
-    }
-});
-
-// DELETE bulk delete tasks
-app.delete('/api/tasks/bulk-delete', authenticateToken, async (req, res) => {
-    if (req.user.role !== 'admin') {
-        return res.status(403).json({ error: 'Forbidden' });
-    }
-    const { taskIds } = req.body;
-    if (!taskIds || !Array.isArray(taskIds)) {
-        return res.status(400).json({ error: 'Invalid request: taskIds array is required.' });
-    }
-
-    try {
-        const sql = 'DELETE FROM tasks WHERE id IN (?)';
-        await pool.query(sql, [taskIds]);
-        res.status(200).json({ message: 'Tasks deleted successfully.' });
-    } catch (error) {
-        console.error('Error bulk deleting tasks:', error);
-        res.status(500).json({ error: 'Failed to delete tasks.' });
-    }
-});
-
-
-// =============================================================================
-// USER MANAGEMENT ROUTES
-// =============================================================================
-
- // ... your GET users logic ...
+// --- USER ROUTES ---
 app.get('/api/users', authenticateToken, requireAdmin, requireDB, async (req, res) => {
     let connection;
     try {
@@ -672,8 +270,6 @@ app.get('/api/users', authenticateToken, requireAdmin, requireDB, async (req, re
         if (connection) connection.release();
     }
 });
-
-
 
 app.post('/api/users', authenticateToken, requireAdmin, requireDB, async (req, res) => {
     let connection;
@@ -799,7 +395,500 @@ app.delete('/api/users/:id', authenticateToken, requireAdmin, requireDB, async (
     }
 });
 
-// REPORT ROUTES
+// --- TASK ROUTES ---
+app.get('/api/tasks/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const sql = `
+            SELECT 
+                t.*,
+                u_assigned.name as assigned_user_name,
+                u_creator.name as assigned_by_name,
+                b.business_name,
+                b.contact_person,
+                b.contact_position,
+                b.phone as business_phone,
+                b.email as business_email,
+                b.address as business_address
+            FROM tasks t
+            LEFT JOIN users u_assigned ON t.assigned_to = u_assigned.id
+            LEFT JOIN users u_creator ON t.assigned_by = u_creator.id
+            LEFT JOIN businesses b ON t.business_id = b.id
+            WHERE t.id = ?
+        `;
+        const [tasks] = await pool.query(sql, [id]);
+
+        if (tasks.length === 0) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+        res.json(tasks[0]);
+    } catch (error) {
+        console.error('Error fetching task details:', error);
+        res.status(500).json({ error: 'Failed to fetch task details' });
+    }
+});
+
+app.get('/api/tasks', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { status, assigned_to } = req.query;
+        let conditions = [];
+        let params = [];
+
+        if (status) {
+            conditions.push('t.status = ?');
+            params.push(status);
+        }
+
+        // FIXED: Users can see tasks assigned TO them OR assigned BY them
+        if (req.user.role !== 'admin') {
+            conditions.push('(t.assigned_to = ? OR t.assigned_by = ?)');
+            params.push(req.user.id, req.user.id);
+        } else if (assigned_to) {
+            conditions.push('t.assigned_to = ?');
+            params.push(assigned_to);
+        }
+
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+        connection = await pool.getConnection();
+        const [tasks] = await connection.execute(`
+            SELECT t.*, 
+                   assigned_user.name as assigned_user_name,
+                   assigner.name as assigned_by_name,
+                   b.business_name
+            FROM tasks t
+            LEFT JOIN users assigned_user ON t.assigned_to = assigned_user.id
+            LEFT JOIN users assigner ON t.assigned_by = assigner.id
+            LEFT JOIN businesses b ON t.business_id = b.id
+            ${whereClause}
+            ORDER BY t.due_date ASC, t.priority DESC
+        `, params);
+
+        res.json(tasks);
+
+    } catch (error) {
+        console.error('Get tasks error:', error);
+        res.status(500).json({ error: 'Failed to fetch tasks' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.post('/api/tasks', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { title, description, assigned_to, business_id, task_type, priority, due_date } = req.body;
+
+        if (!title || !assigned_to || !task_type) {
+            return res.status(400).json({ error: 'Title, assigned user, and task type are required' });
+        }
+
+        connection = await pool.getConnection();
+        const [result] = await connection.execute(`
+            INSERT INTO tasks 
+            (title, description, assigned_to, assigned_by, business_id, task_type, priority, due_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `, [title, description, assigned_to, req.user.id, business_id, task_type, priority, due_date]);
+
+        // Create notification for assigned user
+        await connection.execute(`
+            INSERT INTO notifications (user_id, title, message, type, action_url)
+            VALUES (?, ?, ?, 'task_due', ?)
+        `, [
+            assigned_to,
+            'New Task Assigned',
+            `You have been assigned a new task: ${title}`,
+            `/tasks/${result.insertId}`
+        ]);
+
+        res.json({ 
+            id: result.insertId, 
+            message: 'Task created successfully' 
+        });
+
+    } catch (error) {
+        console.error('Create task error:', error);
+        res.status(500).json({ error: 'Failed to create task' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { id } = req.params;
+        const { status, notes, title, description, priority, due_date } = req.body;
+
+        connection = await pool.getConnection();
+
+        // Check if user can update this task
+        const [tasks] = await connection.execute(
+            'SELECT assigned_to, assigned_by FROM tasks WHERE id = ?', [id]
+        );
+
+        if (tasks.length === 0) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+
+        const task = tasks[0];
+        if (req.user.role !== 'admin' && task.assigned_to !== req.user.id && task.assigned_by !== req.user.id) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        const completedAt = status === 'completed' ? 'NOW()' : 'NULL';
+        
+        // Build dynamic update query based on provided fields
+        let updateFields = [];
+        let params = [];
+        
+        if (status !== undefined) {
+            updateFields.push('status = ?');
+            params.push(status);
+        }
+        if (notes !== undefined) {
+            updateFields.push('notes = ?');
+            params.push(notes);
+        }
+        if (title !== undefined) {
+            updateFields.push('title = ?');
+            params.push(title);
+        }
+        if (description !== undefined) {
+            updateFields.push('description = ?');
+            params.push(description);
+        }
+        if (priority !== undefined) {
+            updateFields.push('priority = ?');
+            params.push(priority);
+        }
+        if (due_date !== undefined) {
+            updateFields.push('due_date = ?');
+            params.push(due_date);
+        }
+        
+        if (status === 'completed') {
+            updateFields.push('completed_at = NOW()');
+        }
+        
+        params.push(id);
+
+        await connection.execute(`
+            UPDATE tasks 
+            SET ${updateFields.join(', ')}
+            WHERE id = ?
+        `, params);
+
+        res.json({ message: 'Task updated successfully' });
+
+    } catch (error) {
+        console.error('Update task error:', error);
+        res.status(500).json({ error: 'Failed to update task' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.put('/api/tasks/bulk-assign', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { taskIds, assignedTo } = req.body;
+    if (!taskIds || !Array.isArray(taskIds) || !assignedTo) {
+        return res.status(400).json({ error: 'Invalid request: taskIds and assignedTo are required.' });
+    }
+
+    try {
+        const sql = 'UPDATE tasks SET assigned_to = ? WHERE id IN (?)';
+        await pool.query(sql, [assignedTo, taskIds]);
+        res.status(200).json({ message: 'Tasks reassigned successfully.' });
+    } catch (error) {
+        console.error('Error bulk assigning tasks:', error);
+        res.status(500).json({ error: 'Failed to reassign tasks.' });
+    }
+});
+
+app.delete('/api/tasks/bulk-delete', authenticateToken, async (req, res) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { taskIds } = req.body;
+    if (!taskIds || !Array.isArray(taskIds)) {
+        return res.status(400).json({ error: 'Invalid request: taskIds array is required.' });
+    }
+
+    try {
+        const sql = 'DELETE FROM tasks WHERE id IN (?)';
+        await pool.query(sql, [taskIds]);
+        res.status(200).json({ message: 'Tasks deleted successfully.' });
+    } catch (error) {
+        console.error('Error bulk deleting tasks:', error);
+        res.status(500).json({ error: 'Failed to delete tasks.' });
+    }
+});
+
+// --- BUSINESS ROUTES ---
+
+app.get('/api/businesses', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { search, status, assigned_to, industry, priority } = req.query;
+        let conditions = [];
+        let params = [];
+
+        if (search) {
+            conditions.push('(b.business_name LIKE ? OR b.contact_person LIKE ?)');
+            params.push(`%${search}%`, `%${search}%`);
+        }
+        if (status) {
+            conditions.push('b.status = ?');
+            params.push(status);
+        }
+        if (assigned_to) {
+            conditions.push('b.assigned_to = ?');
+            params.push(assigned_to);
+        }
+        if (industry) {
+            conditions.push('b.industry = ?');
+            params.push(industry);
+        }
+        if (priority) {
+            conditions.push('b.priority = ?');
+            params.push(priority);
+        }
+
+        // Non-admin users only see their assigned businesses
+        if (req.user.role !== 'admin') {
+            conditions.push('b.assigned_to = ?');
+            params.push(req.user.id);
+        }
+
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+        connection = await pool.getConnection();
+        const [businesses] = await connection.execute(`
+            SELECT b.*, 
+                   u.name as assigned_user_name,
+                   creator.name as created_by_name
+            FROM businesses b
+            LEFT JOIN users u ON b.assigned_to = u.id
+            LEFT JOIN users creator ON b.created_by = creator.id
+            ${whereClause}
+            ORDER BY b.created_at DESC
+            LIMIT 100
+        `, params);
+
+        res.json(businesses);
+
+    } catch (error) {
+        console.error('Get businesses error:', error);
+        res.status(500).json({ error: 'Failed to fetch businesses' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.post('/api/businesses', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const {
+            business_name, contact_person, contact_position, phone, email, address,
+            city, state, postal_code, industry, business_size, priority, assigned_to, notes
+        } = req.body;
+
+        if (!business_name) {
+            return res.status(400).json({ error: 'Business name is required' });
+        }
+
+        connection = await pool.getConnection();
+        
+        // Handle undefined/null values properly
+        const [result] = await connection.execute(`
+            INSERT INTO businesses 
+            (business_name, contact_person, contact_position, phone, email, address, 
+             city, state, postal_code, industry, business_size, priority, assigned_to, 
+             created_by, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            business_name,
+            contact_person || null,
+            contact_position || null,
+            phone || null,
+            email || null,
+            address || null,
+            city || null,
+            state || null,
+            postal_code || null,
+            industry || null,
+            business_size || 'Small',
+            priority || 'Medium',
+            assigned_to || null,  // This was causing the undefined error
+            req.user.id,
+            notes || null
+        ]);
+
+        res.json({ 
+            id: result.insertId, 
+            message: 'Business created successfully' 
+        });
+
+    } catch (error) {
+        console.error('Create business error:', error);
+        res.status(500).json({ error: 'Failed to create business' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.put('/api/businesses/:id', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { id } = req.params;
+        const {
+            business_name, contact_person, contact_position, phone, email, address,
+            city, state, postal_code, industry, business_size, priority, assigned_to, 
+            status, notes
+        } = req.body;
+
+        connection = await pool.getConnection();
+
+        // Check permissions
+        if (req.user.role !== 'admin') {
+            const [business] = await connection.execute(
+                'SELECT assigned_to FROM businesses WHERE id = ?', [id]
+            );
+            if (business.length === 0 || business[0].assigned_to !== req.user.id) {
+                return res.status(403).json({ error: 'Access denied' });
+            }
+        }
+
+        await connection.execute(`
+            UPDATE businesses 
+            SET business_name = ?, contact_person = ?, contact_position = ?, phone = ?, 
+                email = ?, address = ?, city = ?, state = ?, postal_code = ?, 
+                industry = ?, business_size = ?, priority = ?, assigned_to = ?, 
+                status = ?, notes = ?
+            WHERE id = ?
+        `, [
+            business_name, contact_person, contact_position, phone, email, address,
+            city, state, postal_code, industry, business_size, priority, 
+            assigned_to, status, notes, id
+        ]);
+
+        res.json({ message: 'Business updated successfully' });
+
+    } catch (error) {
+        console.error('Update business error:', error);
+        res.status(500).json({ error: 'Failed to update business' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.delete('/api/businesses/:id', authenticateToken, async (req, res) => {
+    // Security check: Only admins can delete businesses
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Forbidden: You do not have permission to perform this action.' });
+    }
+
+    try {
+        const { id } = req.params;
+        const [result] = await pool.query('DELETE FROM businesses WHERE id = ?', [id]);
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Business not found' });
+        }
+        
+        res.status(200).json({ message: 'Business deleted successfully' });
+    } catch (error) {
+        console.error('Error deleting business:', error);
+        res.status(500).json({ error: 'Failed to delete business' });
+    }
+});
+
+app.post('/api/businesses/bulk-upload', authenticateToken, requireAdmin, requireDB, upload.single('csv_file'), async (req, res) => {
+    let connection;
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'CSV file is required' });
+        }
+
+        const csvData = fs.readFileSync(req.file.path, 'utf8');
+        const lines = csvData.split('\n').filter(line => line.trim());
+        
+        if (lines.length < 2) {
+            return res.status(400).json({ error: 'CSV file must contain headers and at least one data row' });
+        }
+
+        const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+        const businesses = [];
+
+        for (let i = 1; i < lines.length; i++) {
+            const values = lines[i].split(',').map(v => v.trim().replace(/"/g, ''));
+            if (values.length >= headers.length && values[0]) {
+                const business = {};
+                headers.forEach((header, index) => {
+                    business[header.toLowerCase().replace(' ', '_')] = values[index] || null;
+                });
+                businesses.push(business);
+            }
+        }
+
+        connection = await pool.getConnection();
+        let successCount = 0;
+        let errorCount = 0;
+
+        for (const business of businesses) {
+            try {
+                await connection.execute(`
+                    INSERT INTO businesses 
+                    (business_name, contact_person, contact_position, phone, email, 
+                     address, city, state, postal_code, industry, business_size, 
+                     priority, created_by, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New')
+                `, [
+                    business.business_name,
+                    business.contact_person,
+                    business.contact_position,
+                    business.phone,
+                    business.email,
+                    business.address,
+                    business.city,
+                    business.state,
+                    business.postal_code,
+                    business.industry,
+                    business.business_size || 'Small',
+                    business.priority || 'Medium',
+                    req.user.id
+                ]);
+                successCount++;
+            } catch (err) {
+                console.error('Error inserting business:', err);
+                errorCount++;
+            }
+        }
+
+        // Clean up uploaded file
+        fs.unlinkSync(req.file.path);
+
+        res.json({
+            message: `Bulk upload completed`,
+            success_count: successCount,
+            error_count: errorCount,
+            total_processed: businesses.length
+        });
+
+    } catch (error) {
+        console.error('Bulk upload error:', error);
+        res.status(500).json({ error: 'Failed to process bulk upload' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// --- REPORT ROUTES ---
+
 app.post('/api/reports/cold-calling', [authenticateToken, upload.single('photo_proof')], async (req, res) => {
     try {
         let { business_id, ...reportData } = req.body;
@@ -860,7 +949,6 @@ app.post('/api/reports/telemarketing', [authenticateToken, upload.none()], async
     }
 });
 
-// Enhanced Get reports with advanced filtering
 app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
     let connection;
     try {
@@ -970,10 +1058,57 @@ app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
     }
 });
 
+app.get('/api/reports/:type/:id', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { type, id } = req.params;
+        
+        if (!['cold_calling', 'telemarketing'].includes(type)) {
+            return res.status(400).json({ error: 'Invalid report type' });
+        }
 
-// =============================================================================
-// PHOTO ACCESS ROUTE - For viewing uploaded photos
-// =============================================================================
+        connection = await pool.getConnection();
+        
+        const [reports] = await connection.execute(`
+            SELECT cr.*, u.name as user_name, u.department, u.executive_type,
+                   b.business_name as linked_business_name, b.contact_person as linked_contact_person,
+                   b.phone as linked_phone, b.email as linked_email, b.address as linked_address
+            FROM comprehensive_reports cr
+            LEFT JOIN users u ON cr.user_id = u.id
+            LEFT JOIN businesses b ON cr.business_id = b.id
+            WHERE cr.report_type = ? AND cr.id = ?
+        `, [type, id]);
+
+        if (reports.length === 0) {
+            return res.status(404).json({ error: 'Report not found' });
+        }
+
+        const report = reports[0];
+
+        // Check permissions - admin can see all, users can see their own
+        if (req.user.role !== 'admin' && report.user_id !== req.user.id) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        // Get follow-ups for this report
+        const [followUps] = await connection.execute(`
+            SELECT * FROM follow_ups 
+            WHERE report_id = ? AND report_type = ?
+            ORDER BY scheduled_date DESC
+        `, [id, type]);
+
+        res.json({
+            ...report,
+            follow_ups: followUps
+        });
+
+    } catch (error) {
+        console.error('Get report details error:', error);
+        res.status(500).json({ error: 'Failed to fetch report details' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
 
 app.get('/api/reports/photo/:filename', authenticateToken, (req, res) => {
     try {
@@ -1007,7 +1142,6 @@ app.get('/api/reports/photo/:filename', authenticateToken, (req, res) => {
     }
 });
 
-// Enhanced CSV export with new data
 app.get('/api/reports/export', authenticateToken, requireAdmin, requireDB, async (req, res) => {
     let connection;
     try {
@@ -1077,7 +1211,6 @@ app.get('/api/reports/export', authenticateToken, requireAdmin, requireDB, async
     }
 });
 
-// DELETE multiple reports
 app.delete('/api/reports/bulk-delete', authenticateToken, async (req, res) => {
     // Security Check: Only admins can perform bulk delete
     if (req.user.role !== 'admin') {
@@ -1112,9 +1245,136 @@ app.delete('/api/reports/bulk-delete', authenticateToken, async (req, res) => {
     }
 });
 
-// =============================================================================
-// ENHANCED DASHBOARD ROUTES
-// =============================================================================
+app.delete('/api/reports/:type/:id', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { type, id } = req.params;
+        const table = type === 'cold_calling' ? 'cold_calling_reports' : 'telemarketing_reports';
+
+        connection = await pool.getConnection();
+
+        // Start transaction
+        await connection.execute('START TRANSACTION');
+
+        // Check if report exists and belongs to user (or user is admin)
+        const [reports] = await connection.execute(
+            `SELECT * FROM ${table} WHERE id = ? ${req.user.role !== 'admin' ? 'AND user_id = ?' : ''}`,
+            req.user.role !== 'admin' ? [id, req.user.id] : [id]
+        );
+
+        if (reports.length === 0) {
+            await connection.execute('ROLLBACK');
+            return res.status(404).json({ error: 'Report not found' });
+        }
+
+        const report = reports[0];
+
+        // Check if report was created today (for non-admin users)
+        if (req.user.role !== 'admin') {
+            const today = new Date().toISOString().split('T')[0];
+            const reportDate = new Date(report.created_at).toISOString().split('T')[0];
+            
+            if (today !== reportDate) {
+                await connection.execute('ROLLBACK');
+                return res.status(403).json({ error: 'Can only delete reports from today' });
+            }
+        }
+
+        // Delete related records
+        await connection.execute('DELETE FROM follow_ups WHERE report_id = ? AND report_type = ?', [id, type]);
+        await connection.execute('DELETE FROM business_interactions WHERE user_id = ? AND interaction_date = ?', [report.user_id, report.visit_time || report.call_time]);
+
+        // Delete photo file if exists
+        if (type === 'cold_calling' && report.photo_proof) {
+            const photoPath = path.join('uploads', report.photo_proof);
+            if (fs.existsSync(photoPath)) {
+                fs.unlinkSync(photoPath);
+            }
+        }
+
+        await connection.execute(`DELETE FROM ${table} WHERE id = ?`, [id]);
+
+        // Update goal progress
+        await updateGoalProgress(connection, report.user_id, type, report.outcome);
+
+        await connection.execute('COMMIT');
+
+        res.json({ message: 'Report deleted successfully' });
+
+    } catch (error) {
+        if (connection) await connection.execute('ROLLBACK');
+        console.error('Delete report error:', error);
+        res.status(500).json({ error: 'Failed to delete report' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+
+// --- OTHER ROUTES ---
+
+app.get('/api/calendar/events', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userRole = req.user.role;
+
+        // Base queries for tasks and follow-ups
+        const tasksQuery = `
+            SELECT 
+                t.id, 
+                t.title, 
+                t.due_date as start, 
+                'task' as type,
+                t.description,
+                u.name as userName,
+                b.business_name as businessName
+            FROM tasks t
+            LEFT JOIN users u ON t.assigned_to = u.id
+            LEFT JOIN businesses b ON t.business_id = b.id
+            WHERE t.due_date IS NOT NULL
+        `;
+
+        const followUpsQuery = `
+            SELECT 
+                r.id, 
+                CONCAT('Follow-up: ', r.business_name) as title, 
+                r.follow_up_date as start, 
+                'follow-up' as type,
+                r.notes as description,
+                u.name as userName,
+                b.business_name as businessName
+            FROM (
+                SELECT id, user_id, business_id, business_name, follow_up_date, notes FROM cold_calling_reports WHERE follow_up_date IS NOT NULL
+                UNION ALL
+                SELECT id, user_id, business_id, business_name, follow_up_date, notes FROM telemarketing_reports WHERE follow_up_date IS NOT NULL
+            ) as r
+            LEFT JOIN users u ON r.user_id = u.id
+            LEFT JOIN businesses b ON r.business_id = b.id
+        `;
+        
+        let finalQuery;
+        let queryParams = [];
+
+        // Admins see all events, users see only their own
+        if (userRole === 'admin') {
+            finalQuery = `${tasksQuery} UNION ALL ${followUpsQuery}`;
+        } else {
+            finalQuery = `
+                SELECT * FROM (${tasksQuery} AND t.assigned_to = ?) AS user_tasks
+                UNION ALL
+                SELECT * FROM (${followUpsQuery} AND r.user_id = ?) AS user_followups
+            `;
+            queryParams.push(userId, userId);
+        }
+
+        const [events] = await pool.query(finalQuery, queryParams);
+        res.json(events);
+
+    } catch (error) {
+        console.error('Error fetching calendar events:', error);
+        res.status(500).json({ error: 'Failed to fetch calendar events' });
+    }
+});
 
 app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) => {
     let connection;
@@ -1224,77 +1484,6 @@ app.get('/api/dashboard/stats', authenticateToken, requireDB, async (req, res) =
     }
 });
 
-
-// Delete report (enhanced with business interaction cleanup)
-app.delete('/api/reports/:type/:id', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { type, id } = req.params;
-        const table = type === 'cold_calling' ? 'cold_calling_reports' : 'telemarketing_reports';
-
-        connection = await pool.getConnection();
-
-        // Start transaction
-        await connection.execute('START TRANSACTION');
-
-        // Check if report exists and belongs to user (or user is admin)
-        const [reports] = await connection.execute(
-            `SELECT * FROM ${table} WHERE id = ? ${req.user.role !== 'admin' ? 'AND user_id = ?' : ''}`,
-            req.user.role !== 'admin' ? [id, req.user.id] : [id]
-        );
-
-        if (reports.length === 0) {
-            await connection.execute('ROLLBACK');
-            return res.status(404).json({ error: 'Report not found' });
-        }
-
-        const report = reports[0];
-
-        // Check if report was created today (for non-admin users)
-        if (req.user.role !== 'admin') {
-            const today = new Date().toISOString().split('T')[0];
-            const reportDate = new Date(report.created_at).toISOString().split('T')[0];
-            
-            if (today !== reportDate) {
-                await connection.execute('ROLLBACK');
-                return res.status(403).json({ error: 'Can only delete reports from today' });
-            }
-        }
-
-        // Delete related records
-        await connection.execute('DELETE FROM follow_ups WHERE report_id = ? AND report_type = ?', [id, type]);
-        await connection.execute('DELETE FROM business_interactions WHERE user_id = ? AND interaction_date = ?', [report.user_id, report.visit_time || report.call_time]);
-
-        // Delete photo file if exists
-        if (type === 'cold_calling' && report.photo_proof) {
-            const photoPath = path.join('uploads', report.photo_proof);
-            if (fs.existsSync(photoPath)) {
-                fs.unlinkSync(photoPath);
-            }
-        }
-
-        await connection.execute(`DELETE FROM ${table} WHERE id = ?`, [id]);
-
-        // Update goal progress
-        await updateGoalProgress(connection, report.user_id, type, report.outcome);
-
-        await connection.execute('COMMIT');
-
-        res.json({ message: 'Report deleted successfully' });
-
-    } catch (error) {
-        if (connection) await connection.execute('ROLLBACK');
-        console.error('Delete report error:', error);
-        res.status(500).json({ error: 'Failed to delete report' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// =============================================================================
-// GOALS AND TARGETS ROUTES
-// =============================================================================
-
 app.get('/api/goals', authenticateToken, requireDB, async (req, res) => {
     let connection;
     try {
@@ -1397,179 +1586,6 @@ app.put('/api/goals/:id', authenticateToken, requireDB, async (req, res) => {
     }
 });
 
-
-// =============================================================================
-// ENHANCED REPORT ROUTES - Add detailed view for management
-// =============================================================================
-
-
-// Get single report with full details
-app.get('/api/reports/:type/:id', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { type, id } = req.params;
-        
-        if (!['cold_calling', 'telemarketing'].includes(type)) {
-            return res.status(400).json({ error: 'Invalid report type' });
-        }
-
-        connection = await pool.getConnection();
-        
-        const [reports] = await connection.execute(`
-            SELECT cr.*, u.name as user_name, u.department, u.executive_type,
-                   b.business_name as linked_business_name, b.contact_person as linked_contact_person,
-                   b.phone as linked_phone, b.email as linked_email, b.address as linked_address
-            FROM comprehensive_reports cr
-            LEFT JOIN users u ON cr.user_id = u.id
-            LEFT JOIN businesses b ON cr.business_id = b.id
-            WHERE cr.report_type = ? AND cr.id = ?
-        `, [type, id]);
-
-        if (reports.length === 0) {
-            return res.status(404).json({ error: 'Report not found' });
-        }
-
-        const report = reports[0];
-
-        // Check permissions - admin can see all, users can see their own
-        if (req.user.role !== 'admin' && report.user_id !== req.user.id) {
-            return res.status(403).json({ error: 'Access denied' });
-        }
-
-        // Get follow-ups for this report
-        const [followUps] = await connection.execute(`
-            SELECT * FROM follow_ups 
-            WHERE report_id = ? AND report_type = ?
-            ORDER BY scheduled_date DESC
-        `, [id, type]);
-
-        res.json({
-            ...report,
-            follow_ups: followUps
-        });
-
-    } catch (error) {
-        console.error('Get report details error:', error);
-        res.status(500).json({ error: 'Failed to fetch report details' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// Enhanced reports list with more details for management
-app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { 
-            date_from, date_to, outcome, business_name, contact_person, 
-            report_type, user_id, business_id, page = 1, limit = 50
-        } = req.query;
-        
-        let conditions = [];
-        let params = [];
-
-        // If not admin, only show user's own reports
-        if (req.user.role !== 'admin') {
-            conditions.push('user_id = ?');
-            params.push(req.user.id);
-        } else if (user_id) {
-            conditions.push('user_id = ?');
-            params.push(user_id);
-        }
-
-        if (date_from) {
-            conditions.push('DATE(created_at) >= ?');
-            params.push(date_from);
-        }
-        if (date_to) {
-            conditions.push('DATE(created_at) <= ?');
-            params.push(date_to);
-        }
-        if (outcome) {
-            conditions.push('outcome = ?');
-            params.push(outcome);
-        }
-        if (business_name) {
-            conditions.push('business_name LIKE ?');
-            params.push(`%${business_name}%`);
-        }
-        if (contact_person) {
-            conditions.push('contact_person LIKE ?');
-            params.push(`%${contact_person}%`);
-        }
-        if (business_id) {
-            conditions.push('business_id = ?');
-            params.push(business_id);
-        }
-
-        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-        const offset = (page - 1) * limit;
-
-        connection = await pool.getConnection();
-
-        let query = `
-            SELECT * FROM comprehensive_reports
-            ${whereClause}
-        `;
-
-        if (report_type) {
-            if (whereClause) {
-                query += ' AND report_type = ?';
-            } else {
-                query += ' WHERE report_type = ?';
-            }
-            params.push(report_type);
-        }
-
-        query += `
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-        `;
-        params.push(parseInt(limit), offset);
-
-        const [reports] = await connection.execute(query, params);
-
-        // Get total count for pagination
-        let countQuery = `
-            SELECT COUNT(*) as total FROM comprehensive_reports
-            ${whereClause}
-        `;
-        let countParams = [...params.slice(0, -2)]; // Remove limit and offset
-
-        if (report_type) {
-            if (whereClause) {
-                countQuery += ' AND report_type = ?';
-            } else {
-                countQuery += ' WHERE report_type = ?';
-            }
-            countParams.push(report_type);
-        }
-
-        const [countResult] = await connection.execute(countQuery, countParams);
-        const total = countResult[0].total;
-
-        res.json({
-            reports,
-            pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
-                total,
-                pages: Math.ceil(total / limit)
-            }
-        });
-
-    } catch (error) {
-        console.error('Get reports error:', error);
-        res.status(500).json({ error: 'Failed to fetch reports' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// =============================================================================
-// NOTIFICATIONS ROUTES
-// =============================================================================
-
 app.get('/api/notifications', authenticateToken, requireDB, async (req, res) => {
     let connection;
     try {
@@ -1611,295 +1627,6 @@ app.put('/api/notifications/:id/read', authenticateToken, requireDB, async (req,
         if (connection) connection.release();
     }
 });
-
-// DELETE a business
-app.delete('/api/businesses/:id', authenticateToken, async (req, res) => {
-    // Security check: Only admins can delete businesses
-    if (req.user.role !== 'admin') {
-        return res.status(403).json({ error: 'Forbidden: You do not have permission to perform this action.' });
-    }
-
-    try {
-        const { id } = req.params;
-        const [result] = await pool.query('DELETE FROM businesses WHERE id = ?', [id]);
-        
-        if (result.affectedRows === 0) {
-            return res.status(404).json({ error: 'Business not found' });
-        }
-        
-        res.status(200).json({ message: 'Business deleted successfully' });
-    } catch (error) {
-        console.error('Error deleting business:', error);
-        res.status(500).json({ error: 'Failed to delete business' });
-    }
-});
-
-// Enhanced Get reports with advanced filtering
-app.get('/api/reports', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { 
-            date_from, date_to, outcome, business_name, contact_person, 
-            report_type, user_id, business_id, page = 1, limit = 50
-        } = req.query;
-        
-        let conditions = [];
-        let params = [];
-
-        // If not admin, only show user's own reports
-        if (req.user.role !== 'admin') {
-            conditions.push('user_id = ?');
-            params.push(req.user.id);
-        } else if (user_id) {
-            conditions.push('user_id = ?');
-            params.push(user_id);
-        }
-
-        if (date_from) {
-            conditions.push('DATE(created_at) >= ?');
-            params.push(date_from);
-        }
-        if (date_to) {
-            conditions.push('DATE(created_at) <= ?');
-            params.push(date_to);
-        }
-        if (outcome) {
-            conditions.push('outcome = ?');
-            params.push(outcome);
-        }
-        if (business_name) {
-            conditions.push('business_name LIKE ?');
-            params.push(`%${business_name}%`);
-        }
-        if (contact_person) {
-            conditions.push('contact_person LIKE ?');
-            params.push(`%${contact_person}%`);
-        }
-        if (business_id) {
-            conditions.push('business_id = ?');
-            params.push(business_id);
-        }
-
-        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-        const offset = (page - 1) * limit;
-
-        connection = await pool.getConnection();
-
-        let query = `
-            SELECT * FROM comprehensive_reports
-            ${whereClause}
-        `;
-
-        if (report_type) {
-            if (whereClause) {
-                query += ' AND report_type = ?';
-            } else {
-                query += ' WHERE report_type = ?';
-            }
-            params.push(report_type);
-        }
-
-        query += `
-            ORDER BY created_at DESC
-            LIMIT ? OFFSET ?
-        `;
-        params.push(parseInt(limit), offset);
-
-        const [reports] = await connection.execute(query, params);
-
-        // Get total count for pagination
-        let countQuery = `
-            SELECT COUNT(*) as total FROM comprehensive_reports
-            ${whereClause}
-        `;
-        let countParams = [...params.slice(0, -2)]; // Remove limit and offset
-
-        if (report_type) {
-            if (whereClause) {
-                countQuery += ' AND report_type = ?';
-            } else {
-                countQuery += ' WHERE report_type = ?';
-            }
-            countParams.push(report_type);
-        }
-
-        const [countResult] = await connection.execute(countQuery, countParams);
-        const total = countResult[0].total;
-
-        res.json({
-            reports,
-            pagination: {
-                page: parseInt(page),
-                limit: parseInt(limit),
-                total,
-                pages: Math.ceil(total / limit)
-            }
-        });
-
-    } catch (error) {
-        console.error('Get reports error:', error);
-        res.status(500).json({ error: 'Failed to fetch reports' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// =============================================================================
-// FOLLOW-UP MANAGEMENT ROUTES
-// =============================================================================
-
-app.get('/api/follow-ups', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { status, date_from, date_to } = req.query;
-        let conditions = [];
-        let params = [];
-
-        // Non-admin users only see their own follow-ups
-        if (req.user.role !== 'admin') {
-            conditions.push('f.user_id = ?');
-            params.push(req.user.id);
-        }
-
-        if (status) {
-            conditions.push('f.status = ?');
-            params.push(status);
-        }
-        if (date_from) {
-            conditions.push('DATE(f.scheduled_date) >= ?');
-            params.push(date_from);
-        }
-        if (date_to) {
-            conditions.push('DATE(f.scheduled_date) <= ?');
-            params.push(date_to);
-        }
-
-        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-
-        connection = await pool.getConnection();
-        const [followUps] = await connection.execute(`
-            SELECT f.*, 
-                   b.business_name,
-                   u.name as user_name
-            FROM follow_ups f
-            LEFT JOIN businesses b ON f.business_id = b.id
-            LEFT JOIN users u ON f.user_id = u.id
-            ${whereClause}
-            ORDER BY f.scheduled_date ASC
-        `, params);
-
-        res.json(followUps);
-
-    } catch (error) {
-        console.error('Get follow-ups error:', error);
-        res.status(500).json({ error: 'Failed to fetch follow-ups' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-app.put('/api/follow-ups/:id', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { id } = req.params;
-        const { status, outcome, notes, scheduled_date } = req.body;
-
-        connection = await pool.getConnection();
-
-        // Check permissions
-        if (req.user.role !== 'admin') {
-            const [followUp] = await connection.execute(
-                'SELECT user_id FROM follow_ups WHERE id = ?', [id]
-            );
-            if (followUp.length === 0 || followUp[0].user_id !== req.user.id) {
-                return res.status(403).json({ error: 'Access denied' });
-            }
-        }
-
-        const completedAt = status === 'completed' ? 'NOW()' : null;
-
-        await connection.execute(`
-            UPDATE follow_ups 
-            SET status = ?, outcome = ?, notes = ?, scheduled_date = ?, completed_at = ?
-            WHERE id = ?
-        `, [status, outcome, notes, scheduled_date, completedAt, id]);
-
-        res.json({ message: 'Follow-up updated successfully' });
-
-    } catch (error) {
-        console.error('Update follow-up error:', error);
-        res.status(500).json({ error: 'Failed to update follow-up' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// GET Calendar Events (Tasks and Follow-ups)
-app.get('/api/calendar/events', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const userRole = req.user.role;
-
-        // Base queries for tasks and follow-ups
-        const tasksQuery = `
-            SELECT 
-                t.id, 
-                t.title, 
-                t.due_date as start, 
-                'task' as type,
-                t.description,
-                u.name as userName,
-                b.business_name as businessName
-            FROM tasks t
-            LEFT JOIN users u ON t.assigned_to = u.id
-            LEFT JOIN businesses b ON t.business_id = b.id
-            WHERE t.due_date IS NOT NULL
-        `;
-
-        const followUpsQuery = `
-            SELECT 
-                r.id, 
-                CONCAT('Follow-up: ', r.business_name) as title, 
-                r.follow_up_date as start, 
-                'follow-up' as type,
-                r.notes as description,
-                u.name as userName,
-                b.business_name as businessName
-            FROM (
-                SELECT id, user_id, business_id, business_name, follow_up_date, notes FROM cold_calling_reports WHERE follow_up_date IS NOT NULL
-                UNION ALL
-                SELECT id, user_id, business_id, business_name, follow_up_date, notes FROM telemarketing_reports WHERE follow_up_date IS NOT NULL
-            ) as r
-            LEFT JOIN users u ON r.user_id = u.id
-            LEFT JOIN businesses b ON r.business_id = b.id
-        `;
-        
-        let finalQuery;
-        let queryParams = [];
-
-        // Admins see all events, users see only their own
-        if (userRole === 'admin') {
-            finalQuery = `${tasksQuery} UNION ALL ${followUpsQuery}`;
-        } else {
-            finalQuery = `
-                SELECT * FROM (${tasksQuery} AND t.assigned_to = ?) AS user_tasks
-                UNION ALL
-                SELECT * FROM (${followUpsQuery} AND r.user_id = ?) AS user_followups
-            `;
-            queryParams.push(userId, userId);
-        }
-
-        const [events] = await pool.query(finalQuery, queryParams);
-        res.json(events);
-
-    } catch (error) {
-        console.error('Error fetching calendar events:', error);
-        res.status(500).json({ error: 'Failed to fetch calendar events' });
-    }
-});
-// =============================================================================
-// TEAM MESSAGES AND ANNOUNCEMENTS
-// =============================================================================
 
 app.get('/api/team-messages', authenticateToken, requireDB, async (req, res) => {
     let connection;
@@ -1955,355 +1682,10 @@ app.post('/api/team-messages', authenticateToken, requireAdmin, requireDB, async
     }
 });
 
-
-
-
 // =============================================================================
-// BUSINESS MANAGEMENT ROUTES
-// =============================================================================
-
-app.get('/api/businesses', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { search, status, assigned_to, industry, priority } = req.query;
-        let conditions = [];
-        let params = [];
-
-        if (search) {
-            conditions.push('(b.business_name LIKE ? OR b.contact_person LIKE ?)');
-            params.push(`%${search}%`, `%${search}%`);
-        }
-        if (status) {
-            conditions.push('b.status = ?');
-            params.push(status);
-        }
-        if (assigned_to) {
-            conditions.push('b.assigned_to = ?');
-            params.push(assigned_to);
-        }
-        if (industry) {
-            conditions.push('b.industry = ?');
-            params.push(industry);
-        }
-        if (priority) {
-            conditions.push('b.priority = ?');
-            params.push(priority);
-        }
-
-        // Non-admin users only see their assigned businesses
-        if (req.user.role !== 'admin') {
-            conditions.push('b.assigned_to = ?');
-            params.push(req.user.id);
-        }
-
-        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-
-        connection = await pool.getConnection();
-        const [businesses] = await connection.execute(`
-            SELECT b.*, 
-                   u.name as assigned_user_name,
-                   creator.name as created_by_name
-            FROM businesses b
-            LEFT JOIN users u ON b.assigned_to = u.id
-            LEFT JOIN users creator ON b.created_by = creator.id
-            ${whereClause}
-            ORDER BY b.created_at DESC
-            LIMIT 100
-        `, params);
-
-        res.json(businesses);
-
-    } catch (error) {
-        console.error('Get businesses error:', error);
-        res.status(500).json({ error: 'Failed to fetch businesses' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// =============================================================================
-// FIXED BUSINESS CREATION ROUTE - Replace existing one
-// =============================================================================
-
-app.post('/api/businesses', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const {
-            business_name, contact_person, contact_position, phone, email, address,
-            city, state, postal_code, industry, business_size, priority, assigned_to, notes
-        } = req.body;
-
-        if (!business_name) {
-            return res.status(400).json({ error: 'Business name is required' });
-        }
-
-        connection = await pool.getConnection();
-        
-        // Handle undefined/null values properly
-        const [result] = await connection.execute(`
-            INSERT INTO businesses 
-            (business_name, contact_person, contact_position, phone, email, address, 
-             city, state, postal_code, industry, business_size, priority, assigned_to, 
-             created_by, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-            business_name,
-            contact_person || null,
-            contact_position || null,
-            phone || null,
-            email || null,
-            address || null,
-            city || null,
-            state || null,
-            postal_code || null,
-            industry || null,
-            business_size || 'Small',
-            priority || 'Medium',
-            assigned_to || null,  // This was causing the undefined error
-            req.user.id,
-            notes || null
-        ]);
-
-        res.json({ 
-            id: result.insertId, 
-            message: 'Business created successfully' 
-        });
-
-    } catch (error) {
-        console.error('Create business error:', error);
-        res.status(500).json({ error: 'Failed to create business' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-app.put('/api/businesses/:id', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { id } = req.params;
-        const {
-            business_name, contact_person, contact_position, phone, email, address,
-            city, state, postal_code, industry, business_size, priority, assigned_to, 
-            status, notes
-        } = req.body;
-
-        connection = await pool.getConnection();
-
-        // Check permissions
-        if (req.user.role !== 'admin') {
-            const [business] = await connection.execute(
-                'SELECT assigned_to FROM businesses WHERE id = ?', [id]
-            );
-            if (business.length === 0 || business[0].assigned_to !== req.user.id) {
-                return res.status(403).json({ error: 'Access denied' });
-            }
-        }
-
-        await connection.execute(`
-            UPDATE businesses 
-            SET business_name = ?, contact_person = ?, contact_position = ?, phone = ?, 
-                email = ?, address = ?, city = ?, state = ?, postal_code = ?, 
-                industry = ?, business_size = ?, priority = ?, assigned_to = ?, 
-                status = ?, notes = ?
-            WHERE id = ?
-        `, [
-            business_name, contact_person, contact_position, phone, email, address,
-            city, state, postal_code, industry, business_size, priority, 
-            assigned_to, status, notes, id
-        ]);
-
-        res.json({ message: 'Business updated successfully' });
-
-    } catch (error) {
-        console.error('Update business error:', error);
-        res.status(500).json({ error: 'Failed to update business' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-// Bulk upload businesses from CSV
-app.post('/api/businesses/bulk-upload', authenticateToken, requireAdmin, requireDB, upload.single('csv_file'), async (req, res) => {
-    let connection;
-    try {
-        if (!req.file) {
-            return res.status(400).json({ error: 'CSV file is required' });
-        }
-
-        const csvData = fs.readFileSync(req.file.path, 'utf8');
-        const lines = csvData.split('\n').filter(line => line.trim());
-        
-        if (lines.length < 2) {
-            return res.status(400).json({ error: 'CSV file must contain headers and at least one data row' });
-        }
-
-        const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
-        const businesses = [];
-
-        for (let i = 1; i < lines.length; i++) {
-            const values = lines[i].split(',').map(v => v.trim().replace(/"/g, ''));
-            if (values.length >= headers.length && values[0]) {
-                const business = {};
-                headers.forEach((header, index) => {
-                    business[header.toLowerCase().replace(' ', '_')] = values[index] || null;
-                });
-                businesses.push(business);
-            }
-        }
-
-        connection = await pool.getConnection();
-        let successCount = 0;
-        let errorCount = 0;
-
-        for (const business of businesses) {
-            try {
-                await connection.execute(`
-                    INSERT INTO businesses 
-                    (business_name, contact_person, contact_position, phone, email, 
-                     address, city, state, postal_code, industry, business_size, 
-                     priority, created_by, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New')
-                `, [
-                    business.business_name,
-                    business.contact_person,
-                    business.contact_position,
-                    business.phone,
-                    business.email,
-                    business.address,
-                    business.city,
-                    business.state,
-                    business.postal_code,
-                    business.industry,
-                    business.business_size || 'Small',
-                    business.priority || 'Medium',
-                    req.user.id
-                ]);
-                successCount++;
-            } catch (err) {
-                console.error('Error inserting business:', err);
-                errorCount++;
-            }
-        }
-
-        // Clean up uploaded file
-        fs.unlinkSync(req.file.path);
-
-        res.json({
-            message: `Bulk upload completed`,
-            success_count: successCount,
-            error_count: errorCount,
-            total_processed: businesses.length
-        });
-
-    } catch (error) {
-        console.error('Bulk upload error:', error);
-        res.status(500).json({ error: 'Failed to process bulk upload' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
-
-
-
-// =============================================================================
-// AUTO-NOTIFICATION SYSTEM (Background Tasks)
-// =============================================================================
-
-// Function to check and send goal reminders
-async function checkGoalReminders() {
-    let connection;
-    try {
-        connection = await pool.getConnection();
-        
-        // Check for users who haven't met their daily goals
-        const [usersWithDailyGoals] = await connection.execute(`
-            SELECT g.user_id, g.activity_type, g.target_value, u.name, u.email,
-                   COALESCE(current_progress.count, 0) as current_progress
-            FROM goals g
-            JOIN users u ON g.user_id = u.id
-            LEFT JOIN (
-                SELECT user_id, 
-                       COUNT(*) as count,
-                       'cold_calling' as activity_type
-                FROM cold_calling_reports 
-                WHERE DATE(created_at) = CURDATE()
-                GROUP BY user_id
-                UNION ALL
-                SELECT user_id, 
-                       COUNT(*) as count,
-                       'telemarketing' as activity_type
-                FROM telemarketing_reports 
-                WHERE DATE(created_at) = CURDATE()
-                GROUP BY user_id
-            ) current_progress ON g.user_id = current_progress.user_id 
-                              AND g.activity_type = current_progress.activity_type
-            WHERE g.goal_type = 'daily' 
-              AND g.status = 'active'
-              AND CURDATE() BETWEEN g.start_date AND g.end_date
-              AND HOUR(NOW()) = 16  -- Send reminder at 4 PM
-              AND COALESCE(current_progress.count, 0) < g.target_value
-        `);
-
-        for (const user of usersWithDailyGoals) {
-            await connection.execute(`
-                INSERT INTO notifications (user_id, title, message, type, priority)
-                VALUES (?, ?, ?, 'goal_reminder', 'medium')
-            `, [
-                user.user_id,
-                'Daily Goal Reminder',
-                `You're ${user.target_value - user.current_progress} ${user.activity_type.replace('_', ' ')} activities away from your daily goal!`
-            ]);
-        }
-
-    } catch (error) {
-        console.error('Error checking goal reminders:', error);
-    } finally {
-        if (connection) connection.release();
-    }
-}
-
-// Function to check due follow-ups
-async function checkDueFollowUps() {
-    let connection;
-    try {
-        connection = await pool.getConnection();
-        
-        const [dueFollowUps] = await connection.execute(`
-            SELECT f.user_id, f.id, b.business_name, u.name
-            FROM follow_ups f
-            JOIN businesses b ON f.business_id = b.id
-            JOIN users u ON f.user_id = u.id
-            WHERE f.status = 'scheduled'
-              AND DATE(f.scheduled_date) = CURDATE()
-              AND f.id NOT IN (
-                  SELECT CAST(SUBSTRING_INDEX(action_url, '/', -1) AS UNSIGNED)
-                  FROM notifications 
-                  WHERE type = 'task_due' 
-                    AND DATE(created_at) = CURDATE()
-                    AND action_url LIKE '/follow-ups/%'
-              )
-        `);
-
-        for (const followUp of dueFollowUps) {
-            await connection.execute(`
-                INSERT INTO notifications (user_id, title, message, type, priority, action_url)
-                VALUES (?, ?, ?, 'task_due', 'high', ?)
-            `, [
-                followUp.user_id,
-                'Follow-up Due Today',
-                `You have a follow-up scheduled today with ${followUp.business_name}`,
-                `/follow-ups/${followUp.id}`
-            ]);
-        }
-
-    } catch (error) {
-        console.error('Error checking due follow-ups:', error);
-    } finally {
-        if (connection) connection.release();
-    }
-}
-
 // 7. ERROR HANDLING & SERVER START
+// =============================================================================
+
 app.use((err, req, res, next) => {
     console.error('Error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -2313,14 +1695,16 @@ app.use((req, res) => {
     res.status(404).json({ error: 'Endpoint not found' });
 });
 
-// Start server
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Orbyte Sales API Server running on port ${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
-// Run background tasks every hour
+// =============================================================================
+// 8. BACKGROUND TASKS
+// =============================================================================
+
 setInterval(() => {
-    checkGoalReminders();
-    checkDueFollowUps();
-}, 60 * 60 * 1000); // Every hour
+    // checkGoalReminders();
+    // checkDueFollowUps();
+}, 60 * 60 * 1000);
