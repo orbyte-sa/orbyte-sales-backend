@@ -1625,34 +1625,7 @@ app.put('/api/notifications/:id/read', authenticateToken, requireDB, async (req,
         if (connection) connection.release();
     }
 });
-// GET all businesses
-app.get('/api/businesses', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        let sql = `
-            SELECT b.*, u.name as assigned_user_name
-            FROM businesses b
-            LEFT JOIN users u ON b.assigned_to = u.id
-        `;
-        
-        // Non-admins only see their assigned businesses
-        if (req.user.role !== 'admin') {
-            sql += ' WHERE b.assigned_to = ?';
-            const [businesses] = await pool.query(sql, [req.user.id]);
-            return res.json(businesses);
-        }
-        
-        sql += ' ORDER BY b.business_name ASC';
-        const [businesses] = await pool.query(sql);
-        res.json(businesses);
 
-    } catch (error) {
-        console.error('Get businesses error:', error);
-        res.status(500).json({ error: 'Failed to fetch businesses' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
 // DELETE a business
 app.delete('/api/businesses/:id', authenticateToken, async (req, res) => {
     // Security check: Only admins can delete businesses
@@ -1949,6 +1922,253 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Orbyte Sales API Server running on port ${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
 });
+
+
+// =============================================================================
+// BUSINESS MANAGEMENT ROUTES
+// =============================================================================
+
+app.get('/api/businesses', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { search, status, assigned_to, industry, priority } = req.query;
+        let conditions = [];
+        let params = [];
+
+        if (search) {
+            conditions.push('(b.business_name LIKE ? OR b.contact_person LIKE ?)');
+            params.push(`%${search}%`, `%${search}%`);
+        }
+        if (status) {
+            conditions.push('b.status = ?');
+            params.push(status);
+        }
+        if (assigned_to) {
+            conditions.push('b.assigned_to = ?');
+            params.push(assigned_to);
+        }
+        if (industry) {
+            conditions.push('b.industry = ?');
+            params.push(industry);
+        }
+        if (priority) {
+            conditions.push('b.priority = ?');
+            params.push(priority);
+        }
+
+        // Non-admin users only see their assigned businesses
+        if (req.user.role !== 'admin') {
+            conditions.push('b.assigned_to = ?');
+            params.push(req.user.id);
+        }
+
+        const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+
+        connection = await pool.getConnection();
+        const [businesses] = await connection.execute(`
+            SELECT b.*, 
+                   u.name as assigned_user_name,
+                   creator.name as created_by_name
+            FROM businesses b
+            LEFT JOIN users u ON b.assigned_to = u.id
+            LEFT JOIN users creator ON b.created_by = creator.id
+            ${whereClause}
+            ORDER BY b.created_at DESC
+            LIMIT 100
+        `, params);
+
+        res.json(businesses);
+
+    } catch (error) {
+        console.error('Get businesses error:', error);
+        res.status(500).json({ error: 'Failed to fetch businesses' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// =============================================================================
+// FIXED BUSINESS CREATION ROUTE - Replace existing one
+// =============================================================================
+
+app.post('/api/businesses', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const {
+            business_name, contact_person, contact_position, phone, email, address,
+            city, state, postal_code, industry, business_size, priority, assigned_to, notes
+        } = req.body;
+
+        if (!business_name) {
+            return res.status(400).json({ error: 'Business name is required' });
+        }
+
+        connection = await pool.getConnection();
+        
+        // Handle undefined/null values properly
+        const [result] = await connection.execute(`
+            INSERT INTO businesses 
+            (business_name, contact_person, contact_position, phone, email, address, 
+             city, state, postal_code, industry, business_size, priority, assigned_to, 
+             created_by, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `, [
+            business_name,
+            contact_person || null,
+            contact_position || null,
+            phone || null,
+            email || null,
+            address || null,
+            city || null,
+            state || null,
+            postal_code || null,
+            industry || null,
+            business_size || 'Small',
+            priority || 'Medium',
+            assigned_to || null,  // This was causing the undefined error
+            req.user.id,
+            notes || null
+        ]);
+
+        res.json({ 
+            id: result.insertId, 
+            message: 'Business created successfully' 
+        });
+
+    } catch (error) {
+        console.error('Create business error:', error);
+        res.status(500).json({ error: 'Failed to create business' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+app.put('/api/businesses/:id', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { id } = req.params;
+        const {
+            business_name, contact_person, contact_position, phone, email, address,
+            city, state, postal_code, industry, business_size, priority, assigned_to, 
+            status, notes
+        } = req.body;
+
+        connection = await pool.getConnection();
+
+        // Check permissions
+        if (req.user.role !== 'admin') {
+            const [business] = await connection.execute(
+                'SELECT assigned_to FROM businesses WHERE id = ?', [id]
+            );
+            if (business.length === 0 || business[0].assigned_to !== req.user.id) {
+                return res.status(403).json({ error: 'Access denied' });
+            }
+        }
+
+        await connection.execute(`
+            UPDATE businesses 
+            SET business_name = ?, contact_person = ?, contact_position = ?, phone = ?, 
+                email = ?, address = ?, city = ?, state = ?, postal_code = ?, 
+                industry = ?, business_size = ?, priority = ?, assigned_to = ?, 
+                status = ?, notes = ?
+            WHERE id = ?
+        `, [
+            business_name, contact_person, contact_position, phone, email, address,
+            city, state, postal_code, industry, business_size, priority, 
+            assigned_to, status, notes, id
+        ]);
+
+        res.json({ message: 'Business updated successfully' });
+
+    } catch (error) {
+        console.error('Update business error:', error);
+        res.status(500).json({ error: 'Failed to update business' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
+// Bulk upload businesses from CSV
+app.post('/api/businesses/bulk-upload', authenticateToken, requireAdmin, requireDB, upload.single('csv_file'), async (req, res) => {
+    let connection;
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'CSV file is required' });
+        }
+
+        const csvData = fs.readFileSync(req.file.path, 'utf8');
+        const lines = csvData.split('\n').filter(line => line.trim());
+        
+        if (lines.length < 2) {
+            return res.status(400).json({ error: 'CSV file must contain headers and at least one data row' });
+        }
+
+        const headers = lines[0].split(',').map(h => h.trim().replace(/"/g, ''));
+        const businesses = [];
+
+        for (let i = 1; i < lines.length; i++) {
+            const values = lines[i].split(',').map(v => v.trim().replace(/"/g, ''));
+            if (values.length >= headers.length && values[0]) {
+                const business = {};
+                headers.forEach((header, index) => {
+                    business[header.toLowerCase().replace(' ', '_')] = values[index] || null;
+                });
+                businesses.push(business);
+            }
+        }
+
+        connection = await pool.getConnection();
+        let successCount = 0;
+        let errorCount = 0;
+
+        for (const business of businesses) {
+            try {
+                await connection.execute(`
+                    INSERT INTO businesses 
+                    (business_name, contact_person, contact_position, phone, email, 
+                     address, city, state, postal_code, industry, business_size, 
+                     priority, created_by, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'New')
+                `, [
+                    business.business_name,
+                    business.contact_person,
+                    business.contact_position,
+                    business.phone,
+                    business.email,
+                    business.address,
+                    business.city,
+                    business.state,
+                    business.postal_code,
+                    business.industry,
+                    business.business_size || 'Small',
+                    business.priority || 'Medium',
+                    req.user.id
+                ]);
+                successCount++;
+            } catch (err) {
+                console.error('Error inserting business:', err);
+                errorCount++;
+            }
+        }
+
+        // Clean up uploaded file
+        fs.unlinkSync(req.file.path);
+
+        res.json({
+            message: `Bulk upload completed`,
+            success_count: successCount,
+            error_count: errorCount,
+            total_processed: businesses.length
+        });
+
+    } catch (error) {
+        console.error('Bulk upload error:', error);
+        res.status(500).json({ error: 'Failed to process bulk upload' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
 
 
 // =============================================================================
