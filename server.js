@@ -546,6 +546,82 @@ app.post('/api/tasks', authenticateToken, requireDB, async (req, res) => {
     }
 });
 
+// ... your PUT task logic ...
+app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        const { id } = req.params;
+        const { status, notes, title, description, priority, due_date } = req.body;
+
+        connection = await pool.getConnection();
+
+        // Check if user can update this task
+        const [tasks] = await connection.execute(
+            'SELECT assigned_to, assigned_by FROM tasks WHERE id = ?', [id]
+        );
+
+        if (tasks.length === 0) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+
+        const task = tasks[0];
+        if (req.user.role !== 'admin' && task.assigned_to !== req.user.id && task.assigned_by !== req.user.id) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        const completedAt = status === 'completed' ? 'NOW()' : 'NULL';
+        
+        // Build dynamic update query based on provided fields
+        let updateFields = [];
+        let params = [];
+        
+        if (status !== undefined) {
+            updateFields.push('status = ?');
+            params.push(status);
+        }
+        if (notes !== undefined) {
+            updateFields.push('notes = ?');
+            params.push(notes);
+        }
+        if (title !== undefined) {
+            updateFields.push('title = ?');
+            params.push(title);
+        }
+        if (description !== undefined) {
+            updateFields.push('description = ?');
+            params.push(description);
+        }
+        if (priority !== undefined) {
+            updateFields.push('priority = ?');
+            params.push(priority);
+        }
+        if (due_date !== undefined) {
+            updateFields.push('due_date = ?');
+            params.push(due_date);
+        }
+        
+        if (status === 'completed') {
+            updateFields.push('completed_at = NOW()');
+        }
+        
+        params.push(id);
+
+        await connection.execute(`
+            UPDATE tasks 
+            SET ${updateFields.join(', ')}
+            WHERE id = ?
+        `, params);
+
+        res.json({ message: 'Task updated successfully' });
+
+    } catch (error) {
+        console.error('Update task error:', error);
+        res.status(500).json({ error: 'Failed to update task' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
+
 // PUT (update) bulk assign tasks
 app.put('/api/tasks/bulk-assign', authenticateToken, async (req, res) => {
     if (req.user.role !== 'admin') {
@@ -1772,7 +1848,69 @@ app.put('/api/follow-ups/:id', authenticateToken, requireDB, async (req, res) =>
     }
 });
 
+// GET Calendar Events (Tasks and Follow-ups)
+app.get('/api/calendar/events', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userRole = req.user.role;
 
+        // Base queries for tasks and follow-ups
+        const tasksQuery = `
+            SELECT 
+                t.id, 
+                t.title, 
+                t.due_date as start, 
+                'task' as type,
+                t.description,
+                u.name as userName,
+                b.business_name as businessName
+            FROM tasks t
+            LEFT JOIN users u ON t.assigned_to = u.id
+            LEFT JOIN businesses b ON t.business_id = b.id
+            WHERE t.due_date IS NOT NULL
+        `;
+
+        const followUpsQuery = `
+            SELECT 
+                r.id, 
+                CONCAT('Follow-up: ', r.business_name) as title, 
+                r.follow_up_date as start, 
+                'follow-up' as type,
+                r.notes as description,
+                u.name as userName,
+                b.business_name as businessName
+            FROM (
+                SELECT id, user_id, business_id, business_name, follow_up_date, notes FROM cold_calling_reports WHERE follow_up_date IS NOT NULL
+                UNION ALL
+                SELECT id, user_id, business_id, business_name, follow_up_date, notes FROM telemarketing_reports WHERE follow_up_date IS NOT NULL
+            ) as r
+            LEFT JOIN users u ON r.user_id = u.id
+            LEFT JOIN businesses b ON r.business_id = b.id
+        `;
+        
+        let finalQuery;
+        let queryParams = [];
+
+        // Admins see all events, users see only their own
+        if (userRole === 'admin') {
+            finalQuery = `${tasksQuery} UNION ALL ${followUpsQuery}`;
+        } else {
+            finalQuery = `
+                SELECT * FROM (${tasksQuery} AND t.assigned_to = ?) AS user_tasks
+                UNION ALL
+                SELECT * FROM (${followUpsQuery} AND r.user_id = ?) AS user_followups
+            `;
+            queryParams.push(userId, userId);
+        }
+
+        const [events] = await pool.query(finalQuery, queryParams);
+        res.json(events);
+
+    } catch (error) {
+        console.error('Error fetching calendar events:', error);
+        res.status(500).json({ error: 'Failed to fetch calendar events' });
+    }
+});
 // =============================================================================
 // TEAM MESSAGES AND ANNOUNCEMENTS
 // =============================================================================
