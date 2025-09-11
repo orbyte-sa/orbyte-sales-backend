@@ -1969,21 +1969,7 @@ app.post('/api/team-messages', authenticateToken, requireAdmin, requireDB, async
     }
 });
 
-// 7. ERROR HANDLING & SERVER START
-app.use((err, req, res, next) => {
-    console.error('Error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-});
 
-app.use((req, res) => {
-    res.status(404).json({ error: 'Endpoint not found' });
-});
-
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Orbyte Sales API Server running on port ${PORT}`);
-    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-});
 
 
 // =============================================================================
@@ -2330,6 +2316,22 @@ async function checkDueFollowUps() {
         if (connection) connection.release();
     }
 }
+
+// 7. ERROR HANDLING & SERVER START
+app.use((err, req, res, next) => {
+    console.error('Error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+});
+
+app.use((req, res) => {
+    res.status(404).json({ error: 'Endpoint not found' });
+});
+
+// Start server
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Orbyte Sales API Server running on port ${PORT}`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+});
 
 // Run background tasks every hour
 setInterval(() => {
