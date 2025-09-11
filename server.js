@@ -1625,7 +1625,34 @@ app.put('/api/notifications/:id/read', authenticateToken, requireDB, async (req,
         if (connection) connection.release();
     }
 });
+// GET all businesses
+app.get('/api/businesses', authenticateToken, requireDB, async (req, res) => {
+    let connection;
+    try {
+        let sql = `
+            SELECT b.*, u.name as assigned_user_name
+            FROM businesses b
+            LEFT JOIN users u ON b.assigned_to = u.id
+        `;
+        
+        // Non-admins only see their assigned businesses
+        if (req.user.role !== 'admin') {
+            sql += ' WHERE b.assigned_to = ?';
+            const [businesses] = await pool.query(sql, [req.user.id]);
+            return res.json(businesses);
+        }
+        
+        sql += ' ORDER BY b.business_name ASC';
+        const [businesses] = await pool.query(sql);
+        res.json(businesses);
 
+    } catch (error) {
+        console.error('Get businesses error:', error);
+        res.status(500).json({ error: 'Failed to fetch businesses' });
+    } finally {
+        if (connection) connection.release();
+    }
+});
 // DELETE a business
 app.delete('/api/businesses/:id', authenticateToken, async (req, res) => {
     // Security check: Only admins can delete businesses
