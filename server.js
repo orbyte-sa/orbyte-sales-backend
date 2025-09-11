@@ -505,46 +505,7 @@ app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
     }
 });
 
- // ... your POST task logic ...
-app.post('/api/tasks', authenticateToken, requireDB, async (req, res) => {
-    let connection;
-    try {
-        const { title, description, assigned_to, business_id, task_type, priority, due_date } = req.body;
 
-        if (!title || !assigned_to || !task_type) {
-            return res.status(400).json({ error: 'Title, assigned user, and task type are required' });
-        }
-
-        connection = await pool.getConnection();
-        const [result] = await connection.execute(`
-            INSERT INTO tasks 
-            (title, description, assigned_to, assigned_by, business_id, task_type, priority, due_date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `, [title, description, assigned_to, req.user.id, business_id, task_type, priority, due_date]);
-
-        // Create notification for assigned user
-        await connection.execute(`
-            INSERT INTO notifications (user_id, title, message, type, action_url)
-            VALUES (?, ?, ?, 'task_due', ?)
-        `, [
-            assigned_to,
-            'New Task Assigned',
-            `You have been assigned a new task: ${title}`,
-            `/tasks/${result.insertId}`
-        ]);
-
-        res.json({ 
-            id: result.insertId, 
-            message: 'Task created successfully' 
-        });
-
-    } catch (error) {
-        console.error('Create task error:', error);
-        res.status(500).json({ error: 'Failed to create task' });
-    } finally {
-        if (connection) connection.release();
-    }
-});
 
 // ... your PUT task logic ...
 app.put('/api/tasks/:id', authenticateToken, requireDB, async (req, res) => {
