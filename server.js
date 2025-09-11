@@ -32,7 +32,38 @@ app.use('/uploads', express.static('uploads'));
 if (!fs.existsSync('uploads')) {
     fs.mkdirSync('uploads', { recursive: true });
 }
+// GET a single task with full details (including business info)
+app.get('/api/tasks/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const sql = `
+            SELECT 
+                t.*,
+                u_assigned.name as assigned_user_name,
+                u_creator.name as assigned_by_name,
+                b.business_name,
+                b.contact_person,
+                b.contact_position,
+                b.phone as business_phone,
+                b.email as business_email,
+                b.address as business_address
+            FROM tasks t
+            LEFT JOIN users u_assigned ON t.assigned_to = u_assigned.id
+            LEFT JOIN users u_creator ON t.assigned_by = u_creator.id
+            LEFT JOIN businesses b ON t.business_id = b.id
+            WHERE t.id = ?
+        `;
+        const [tasks] = await pool.query(sql, [id]);
 
+        if (tasks.length === 0) {
+            return res.status(404).json({ error: 'Task not found' });
+        }
+        res.json(tasks[0]);
+    } catch (error) {
+        console.error('Error fetching task details:', error);
+        res.status(500).json({ error: 'Failed to fetch task details' });
+    }
+});
 // Database configuration
 const poolConfig = {
     host: process.env.DB_HOST || '193.203.168.132',
