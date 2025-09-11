@@ -390,45 +390,26 @@ app.get('/api/tasks', authenticateToken, requireDB, async (req, res) => {
 });
 
 
+// In server.js, update the POST /api/tasks endpoint (around line 403):
+
 app.post('/api/tasks', authenticateToken, requireDB, async (req, res) => {
     let connection;
     try {
-        const { 
-            title, description, assigned_to, task_type, priority, due_date, 
-            business_name, contact_person, contact_position, phone, email, address 
-        } = req.body;
-        
-        let { business_id } = req.body;
+        const { title, description, assigned_to, business_id, task_type, priority, due_date } = req.body;
 
         if (!title || !assigned_to || !task_type) {
             return res.status(400).json({ error: 'Title, assigned user, and task type are required' });
         }
 
+        // Handle empty business_id - convert empty string to null
+        const businessId = business_id && business_id !== '' ? business_id : null;
+
         connection = await pool.getConnection();
-
-        // --- NEW LOGIC ---
-        // If no business_id is selected but a business_name is provided, create/find it
-        if ((!business_id || business_id === 'null' || business_id === '') && business_name) {
-            business_id = await getOrCreateBusiness(pool, {
-                business_name,
-                contact_person,
-                contact_position,
-                contact_phone: phone,
-                contact_email: email,
-                created_by: req.user.id
-            });
-        }
-        // --- END NEW LOGIC ---
-
         const [result] = await connection.execute(`
             INSERT INTO tasks 
             (title, description, assigned_to, assigned_by, business_id, task_type, priority, due_date)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `, [
-            title, description, assigned_to, req.user.id, 
-            business_id || null, // Ensure business_id is null if not provided
-            task_type, priority, due_date
-        ]);
+        `, [title, description, assigned_to, req.user.id, businessId, task_type, priority, due_date]);
 
         // Create notification for assigned user
         await connection.execute(`
@@ -441,7 +422,7 @@ app.post('/api/tasks', authenticateToken, requireDB, async (req, res) => {
             `/tasks/${result.insertId}`
         ]);
 
-        res.status(201).json({ 
+        res.json({ 
             id: result.insertId, 
             message: 'Task created successfully' 
         });
