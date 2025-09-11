@@ -1,3 +1,7 @@
+// 1. IMPORTS
+const express = require('express');
+const mysql = require('mysql2/promise');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const cors = require('cors');
@@ -141,6 +145,7 @@ async function updateGoalProgress(connection, userId, activityType, outcome) {
 
 // Initialize database connection
 testConnection();
+
 
 // 6. API ROUTES
 
